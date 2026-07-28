@@ -2,19 +2,24 @@
 #   miss(t) = fraction of decodes NOT converged by deadline t.
 # One figure per code family (surface, BB); rows = stopping criteria, columns =
 # codes (code description as the column title). Reads deadline_data.npz.
+import os
 import numpy as np
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
-HERE = "/workspaces/qec-ensemble-test/docs_deadline"
+HERE = os.path.join(
+    os.environ.get("QEC_DATA_ROOT", "/workspaces/qec-ensemble-test"), "docs_deadline")
 D = np.load(f"{HERE}/deadline_data.npz", allow_pickle=True)
 COLORS = {1: "#2a78d6", 2: "#eb6834", 4: "#1baf7a", 8: "#eda100"}
 SURF, INK, MUTED, GRID = "#fcfcfb", "#1a1a19", "#6b6a66", "#e3e2dd"
 NS = [1, 2, 4, 8]
 CRITS = [(0, "FirstConv"), (1, "NConv(5)")]
+SURF3 = os.environ.get("SURF3", "surf_d9_r27")   # third surface code slug (overridable)
 DISP = {"surf_d9_r9": "surface code d=9, r=9", "surf_d9_r27": "surface code d=9, r=27",
         "bb72": "BB [[72,12,6]]", "bb144": "BB [[144,12,12]]"}
+def disp(slug):                                  # title: DISP, else the code's own label
+    return DISP.get(slug) or str(D[f"{slug}__meta"][0])
 plt.rcParams.update({"figure.facecolor": SURF, "axes.facecolor": SURF, "font.size": 11,
                      "text.color": INK, "axes.labelcolor": INK, "xtick.color": MUTED,
                      "ytick.color": MUTED, "axes.edgecolor": GRID})
@@ -44,7 +49,7 @@ def make(codes, out):
                         label=f"N = {N}" + (" (RelayBP)" if N == 1 else ""))
             ax.set_xscale("log"); ax.set_yscale("log")
             if i == 0:
-                ax.set_title(DISP[slug], fontsize=12.5, fontweight="bold")
+                ax.set_title(disp(slug), fontsize=12.5, fontweight="bold")
             if i == len(CRITS) - 1:
                 ax.set_xlabel("hard deadline (ms)")
             if j == 0:
@@ -61,5 +66,5 @@ def make(codes, out):
     print("wrote", out.split("/")[-1])
 
 
-make(["surf_d9_r9", "surf_d9_r27"], f"{HERE}/deadline_surface.png")
+make(["surf_d9_r9", SURF3], f"{HERE}/deadline_surface.png")
 make(["bb72", "bb144"], f"{HERE}/deadline_bb.png")

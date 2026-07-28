@@ -2,15 +2,19 @@
 # version plot_latency_dist_p50p99.py, which is kept). Proper log-binned
 # histograms (density per decade, so directly comparable to the KDE), with p50
 # (solid) and p99 (dotted) marked per ensemble size N. Reads report_data.npz.
+import os
 import numpy as np
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
-Z = np.load("/workspaces/qec-ensemble-test/docs_report/report_data.npz", allow_pickle=True)
+REPORT_DIR = os.path.join(
+    os.environ.get("QEC_DATA_ROOT", "/workspaces/qec-ensemble-test"), "docs_report")
+Z = np.load(os.path.join(REPORT_DIR, "report_data.npz"), allow_pickle=True)
 COLORS = {1: "#2a78d6", 2: "#eb6834", 4: "#1baf7a", 8: "#eda100"}
 SURF, INK, MUTED, GRID = "#fcfcfb", "#1a1a19", "#6b6a66", "#e3e2dd"
-PANELS = ["surf_d9_r9", "surf_d9_r27", "bb72", "bb144"]
+SURF3 = os.environ.get("SURF3", "surf_d9_r27")   # third surface code slug (overridable)
+PANELS = ["surf_d9_r9", SURF3, "bb72", "bb144"]
 NBINS = 90
 plt.rcParams.update({"figure.facecolor": SURF, "axes.facecolor": SURF, "font.size": 10.5,
                      "text.color": INK, "axes.labelcolor": INK, "xtick.color": MUTED,
@@ -44,6 +48,6 @@ axes[0, 0].legend(frameon=False, fontsize=9, loc="upper right", title="ensemble 
 fig.suptitle("Decode-latency distribution — "
              "solid = p50, dotted = p99", fontsize=13, fontweight="bold")
 fig.tight_layout(rect=[0, 0, 1, 0.96])
-fig.savefig("/workspaces/qec-ensemble-test/docs_report/latency_dist_p50p99_hist.png",
+fig.savefig(os.path.join(REPORT_DIR, "latency_dist_p50p99_hist.png"),
             dpi=150, facecolor=SURF)
 print("wrote latency_dist_p50p99_hist.png")

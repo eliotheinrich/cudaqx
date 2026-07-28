@@ -15,6 +15,7 @@
 #   python3 -u run_deadline.py
 # ============================================================================ #
 import glob, os, time, numpy as np, stim, cudaq, cudaq_qec as qec
+from basis_filter import filter_detectors_by_basis  # Z-component detector filter
 
 # BB_DIR / data root / SHOTS overridable via env; defaults reproduce the original run.
 BB_DIR = os.environ.get(
@@ -35,7 +36,7 @@ GAMMA0 = 0.125                              # same gamma0 for every code
 CODES = [
     ("surf_d5_r5",  "surface d=5, r=5",  "surface", dict(d=5, r=5,  p=SURF_P), GAMMA0),
     ("surf_d9_r9",  "surface d=9, r=9",  "surface", dict(d=9, r=9,  p=SURF_P), GAMMA0),
-    ("surf_d9_r27", "surface d=9, r=27", "surface", dict(d=9, r=27, p=SURF_P), GAMMA0),
+    ("surf_d9_r18", "surface d=9, r=18", "surface", dict(d=9, r=18, p=SURF_P), GAMMA0),
     ("bb72",  "BB [[72,12,6]]",   "bb", dict(tag="72,12,6",   p=BB72_P), GAMMA0),
     ("bb144", "BB [[144,12,12]]", "bb", dict(tag="144,12,12", p=BB144_P), GAMMA0),
 ]
@@ -56,7 +57,9 @@ def stim_to_cudaq_dem(dem):
 
 def build_bb(tag, p, shots):
     f = [x for x in glob.glob(f"{BB_DIR}/*") if tag in x and "_Z" in x and f"p={p}," in x][0]
-    c = stim.Circuit.from_file(f); cd = stim_to_cudaq_dem(c.detector_error_model()); cd.canonicalize_for_rounds(1)
+    c = stim.Circuit.from_file(f)
+    c = filter_detectors_by_basis(c, "Z")   # Z-component: keep Z stabilizer detectors
+    cd = stim_to_cudaq_dem(c.detector_error_model()); cd.canonicalize_for_rounds(1)
     H = cd.detector_error_matrix; s = c.compile_detector_sampler(seed=42)
     dets, _ = s.sample(shots, separate_observables=True, bit_packed=True)
     syn = np.unpackbits(dets, bitorder="little", axis=1).astype(np.uint8)[:, :H.shape[0]]
@@ -67,11 +70,10 @@ def build_surface(d, r, p, shots):
     cudaq.set_target("stim"); cudaq.set_random_seed(7)
     code = qec.get_code("surface_code", distance=d); noise = cudaq.NoiseModel()
     noise.add_all_qubit_channel("x", cudaq.Depolarization2(p), 1)
-    # Full memory-circuit DEM: sample_memory_circuit syndromes align with
-    # dem_from_memory_circuit (both X and Z detectors).
-    syn, _ = qec.sample_memory_circuit(code, qec.operation.prep0, shots, r, noise)
+    # Z-component only: z_sample/z_dem give Z-detector syndromes and the Z DEM.
+    syn, _ = qec.z_sample_memory_circuit(code, qec.operation.prep0, shots, r, noise)
     syn = np.asarray(syn).astype(np.uint8)
-    dem = qec.dem_from_memory_circuit(code, qec.operation.prep0, r, noise)
+    dem = qec.z_dem_from_memory_circuit(code, qec.operation.prep0, r, noise)
     return dem.detector_error_matrix, np.array(dem.error_rates), syn
 
 
