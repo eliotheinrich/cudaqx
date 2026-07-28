@@ -110,20 +110,20 @@ QS = [("p50", 50), ("p90", 90), ("p99", 99)]
 PC = {"p50": "#2a78d6", "p90": "#eb6834", "p99": "#1baf7a"}
 fig, axes = plt.subplots(1, len(ORDER), figsize=(5 * len(ORDER), 4.6), sharex=True)
 for ax, slug in zip(np.atleast_1d(axes), ORDER):
-    label, dem = Zr[f"{slug}__meta"][0], Zr[f"{slug}__meta"][1]
+    label = Zr[f"{slug}__meta"][0]
     for name, q in QS:
         ys = [np.percentile(Zr[f"{slug}__{CI}__N{N}__wall"], q) for N in NS]
         ax.plot(NS, ys, "-o", color=PC[name], lw=2, ms=7, mec=SURF, mew=1.2, label=name)
         ax.annotate(f"{ys[-1] / ys[0]:.2f}×", (NS[-1], ys[-1]), textcoords="offset points",
                     xytext=(7, 0), color=PC[name], fontsize=9, fontweight="bold", va="center")
-    ax.set_yscale("log"); ax.set_title(f"{label}  (Z-DEM {dem})", fontsize=11, fontweight="bold")
+    ax.set_yscale("log"); ax.set_title(f"{label}", fontsize=11, fontweight="bold")
     logN(ax); despine(ax)
 axes[0].legend(frameon=False, fontsize=11, title="percentile", title_fontproperties={"weight": "bold", "size": 10})
 fig.supylabel("latency (ms)", fontsize=11)
 fig.text(0.5, 0.012, f"Right-edge labels: each percentile at N={NS[-1]} relative to N=1",
          ha="center", fontsize=9, color=MUTED)
 fig.tight_layout(rect=[0, 0.05, 1, 1])
-fig.savefig(os.path.join(REP, "latency_percentiles.png"), dpi=150, facecolor=SURF)
+fig.savefig(os.path.join(REP, "relaybp_gamma_ensemble_perf.png"), dpi=150, facecolor=SURF)
 plt.close(fig)
 
 # ---------------- Figure 4: LER(t) under a hard deadline (2 x 4) ------------- #
@@ -164,4 +164,4 @@ fig.suptitle("Logical error rate vs hard deadline  —  LER(t) = P(latency > t o
 fig.tight_layout(rect=[0.02, 0, 1, 0.97])
 fig.savefig(os.path.join(DLD, "deadline_bb.png"), dpi=150, facecolor=SURF)
 plt.close(fig)
-print("wrote model_decomposition.png, latency_dist_p50p99_hist.png, latency_percentiles.png, deadline_bb.png (LER)")
+print("wrote model_decomposition.png, latency_dist_p50p99_hist.png, relaybp_gamma_ensemble_perf.png, deadline_bb.png (LER)")

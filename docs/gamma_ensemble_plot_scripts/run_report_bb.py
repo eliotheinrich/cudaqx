@@ -32,9 +32,9 @@ BB144_P = os.environ.get("BB144_P", "0.003")
 BB288_P = os.environ.get("BB288_P", "0.003")
 # (slug, label, kind, params, num_sets, gamma_dist)
 CODES = [
-    ("surf_d9_r9", "surface d=9, r=9", "surface", dict(d=9, r=9, p=SURF_P), 300, [-0.24, 0.66]),
-    ("bb72",  "BB [[72,12,6]]",   "bb", dict(tag="72,12,6",   p=BB72_P),  300, [-0.24, 0.66]),
-    ("bb144", "BB [[144,12,12]]", "bb", dict(tag="144,12,12", p=BB144_P), 300, [-0.24, 0.66]),
+    ("surf_d9_r9", "surface d=9, r=9", "surface", dict(d=9, r=9, p=SURF_P), 600, [-0.24, 0.66]),
+    ("bb72",  "BB [[72,12,6]]",   "bb", dict(tag="72,12,6",   p=BB72_P),  600, [-0.24, 0.66]),
+    ("bb144", "BB [[144,12,12]]", "bb", dict(tag="144,12,12", p=BB144_P), 600, [-0.24, 0.66]),
     ("bb288", "BB [[288,12,18]]", "bb", dict(tag="288,12,18", p=BB288_P), 600, [-0.161, 0.815]),
 ]
 
