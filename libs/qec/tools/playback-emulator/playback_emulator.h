@@ -1,0 +1,308 @@
+/****************************************************************-*- C++ -*-****
+ * Copyright (c) 2026 NVIDIA Corporation & Affiliates.                         *
+ * All rights reserved.                                                        *
+ *                                                                             *
+ * This source code and the accompanying materials are made available under    *
+ * the terms of the Apache License 2.0 which accompanies this distribution.    *
+ ******************************************************************************/
+
+#pragma once
+
+/// @file playback_emulator.h
+/// @brief Timing core of the syndrome playback emulator: stands in for a quantum
+/// controller by replaying pre-recorded syndrome bits into the realtime
+/// decoding API on a user-supplied schedule.
+///
+/// The design goal is that the ONLY work on the timing thread between two
+/// deadlines is (a) waiting and (b) one sink call.  Everything else -- parsing,
+/// slicing, allocation, formatting -- happens before the run anchor `t0`.
+///
+/// Deadlines are precomputed as absolute offsets from `t0` by prefix-summing
+/// the user's relative deltas, so a late wake-up never propagates into later
+/// events.  On overrun the runner fires as soon as it can and does NOT rewrite
+/// the table: the schedule shifts naturally, no event is dropped, and the
+/// lateness shows up in the stats rather than being silently absorbed.
+///
+/// This header is deliberately free of CUDA-Q dependencies so the timing core
+/// can be built and characterized (against `null_sink`) on any machine.
+
+#include <cstdint>
+#include <map>
+#include <string>
+#include <vector>
+
+namespace cudaq::qec::emulator {
+
+//===----------------------------------------------------------------------===//
+// Configuration
+//===----------------------------------------------------------------------===//
+
+/// Real-time pacing knobs.  
+struct run_config {
+  /// How long before each deadline to stop sleeping and start watching the
+  /// clock.  The runner sleeps off the bulk of the gap and spins only the last
+  /// stretch
+  std::uint64_t spin_slack_ns = 100'000;
+  /// Gap between `run()` being called and `t0`.  Gives the caches and the sink 
+  // a moment to settle.
+  std::uint64_t lead_in_ns = 50'000'000;
+  /// Core to pin the timing thread to, or -1 for no affinity change.
+  int pin_cpu = -1;
+};
+
+//===----------------------------------------------------------------------===//
+// Playback file
+//===----------------------------------------------------------------------===//
+//
+// One record per line, whitespace-separated:
+//
+//     <tick> <operation> <decoder_id> [operands...]
+//
+//   tick        Unsigned integer TICK INDEX, counted from the start of the run
+//               (t0).  A tick is a fixed wall-clock duration supplied
+//               separately (`--tick=1us`, or `tick_ns` to `build_events`), so a
+//               file describes a cadence in the units the hardware actually
+//               runs at, and the same file can be replayed faster or slower by
+//               changing one parameter.
+//
+//               Absolute by default -- tick 7 is the 7th tick boundary, not
+//               "7 after the last one" -- and must be non-decreasing.  Pass
+//               `deltas = true` to `build_events` to read the column as gaps in
+//               ticks instead, which is often easier to write by hand.
+//   operation   One of the three below.  An unknown operation is a parse error,
+//               never a silent skip.
+//   decoder_id  Which syndrome source this record belongs to.  ONE file can
+//               describe a whole multi-source experiment; each emulator
+//               process selects its own decoder's records and ignores the rest
+//               (see `build_events`).
+//
+// Operations and their operands:
+//
+//   enqueue <bits>
+//       Push one round of syndrome bits.  `bits` is a run of `0`/`1`
+//       characters, one per syndrome bit, no separators.  Fire-and-forget on
+//       the wire: the dispatcher ACKs but returns no body.
+//
+//   get_corrections
+//       Read back the accumulated corrections.  Always returns the decoder's
+//       declared observable count -- that is the only width it accepts -- and
+//       never resets.  Follow it with an explicit `reset` when a shot boundary
+//       needs the accumulator cleared, so that clearing is visible in the file
+//       rather than hidden in a flag.
+//
+//   reset
+//       Clear the decoder's queued syndromes and zero its corrections.
+//
+// Blank lines are ignored and `#` starts a comment that runs to end of line.
+//
+// Example:
+//     # tick    op               dec  operands      (with --tick=1us)
+//     0         reset            0
+//     1         enqueue          0    010
+//     2         enqueue          0    110
+//     2         enqueue          1    001
+//     3         get_corrections  0
+//     4         reset            0
+//
+//===----------------------------------------------------------------------===//
+
+/// Operations a record can carry, one-to-one with the three decoding RPCs.
+enum class operation { enqueue, get_corrections, reset };
+
+const char *to_string(operation op);
+bool parse_operation(const std::string &text, operation &out);
+
+/// True when `op` carries syndrome bits.
+bool takes_syndromes(operation op);
+
+/// True when `op` reads a result back, and so must wait for its response.
+bool returns_corrections(operation op);
+
+/// One parsed record.  The syndrome bits live in the file's shared arena rather
+/// than in the record, so a record stays small and the bits stay contiguous.
+struct playback_record {
+  std::uint64_t tick;
+  operation op;
+  std::uint64_t decoder_id;
+  std::size_t bit_offset;  ///< Index into `playback_file::bits`.
+  std::uint64_t bit_count; ///< 0 unless `takes_syndromes(op)`.
+};
+
+/// Metadata parsed from `# PLAYBACK_META` header lines.  Zero means "not
+/// specified" -- load_playback never fabricates a value.
+struct playback_meta {
+  std::uint64_t syndrome_size = 0; ///< Total syndrome bits per shot.
+};
+
+/// A parsed playback file: every record, plus one flat buffer holding every
+/// record's syndrome bits at one byte per bit (0x00 / 0x01).  That is exactly
+/// the shape `rpc_producer::enqueue_syndromes` wants, so the send path copies
+/// nothing -- the payloads are sliced once, here, before the run starts.
+struct playback_file {
+  std::vector<std::uint8_t> bits;
+  std::vector<playback_record> records;
+  std::map<std::uint64_t, playback_meta> meta; ///< Keyed by decoder_id.
+};
+
+/// A scheduled send, fully resolved at load time: a slice of the arena plus its
+/// deadline as an offset from `t0`.  Neither field is recomputed or mutated
+/// once the run starts.
+struct event {
+  operation op;
+  const std::uint8_t *data; ///< Into `playback_file::bits`.  One bit per BYTE
+                            ///< (0x00 / 0x01), which is the shape
+                            ///< `rpc_producer::enqueue_syndromes` wants, so the
+                            ///< send path copies nothing.  Null unless
+                            ///< `takes_syndromes(op)`.
+  std::uint64_t num_bits;   ///< Syndrome bits, matching `record::bit_count`.
+                            ///< Equal to the byte length of `data` only because
+                            ///< of the one-bit-per-byte layout -- it is a BIT
+                            ///< count, and goes on the wire as such.
+  std::uint64_t offset_ns;
+};
+
+/// Parse a playback file.  Throws `std::runtime_error` naming the file and line
+/// on any malformed record.
+playback_file load_playback(const std::string &path);
+
+/// Resolve the records belonging to `decoder_id` into a run schedule.
+///
+/// Timestamps become offsets from `t0`: used as-is when absolute, prefix-summed
+/// when `deltas` is set.  Either way the arithmetic happens HERE, once, so the
+/// run loop never derives one deadline from another and a late wake-up cannot
+/// accumulate.
+///
+/// @param file        Parsed file.
+/// @param decoder_id  Keep only records for this decoder; the rest belong to
+///                    other emulator processes.
+/// @param tick_ns     Wall-clock duration of one tick, in nanoseconds.  The
+///                    resolved deadline for a record is `tick * tick_ns`.
+/// @param deltas      Read `tick` as a gap from the previous kept record
+///                    rather than as an absolute offset.
+/// @param out_skipped If non-null, receives the number of records dropped
+///                    because they belong to another decoder.  Silent
+///                    filtering would make a mistyped `--decoder-id` look like
+///                    an empty file.
+///
+/// Throws if absolute timestamps go backwards, or if no record matches.
+std::vector<event> build_events(const playback_file &file,
+                                std::uint64_t decoder_id,
+                                std::uint64_t tick_ns, bool deltas,
+                                std::size_t *out_skipped = nullptr);
+
+/// Parse a tick duration written with an explicit unit -- `500ns`, `1us`,
+/// `2.5ms`, `1s` -- into nanoseconds.  `us` may also be spelled `µs`.
+/// A unit is REQUIRED.
+///
+/// Returns false on a malformed value, an unknown unit, or an overflow.
+bool parse_duration_ns(const std::string &text, std::uint64_t &out);
+
+//===----------------------------------------------------------------------===//
+// Sinks
+//===----------------------------------------------------------------------===//
+
+/// Destination for scheduled payloads.  `send` is the only thing the runner
+/// calls on the timing thread, and it sits directly in the critical path:
+/// implementations must not allocate, log, or block on anything avoidable.
+class sink {
+public:
+  virtual ~sink() = default;
+
+  /// @param e   The event whose deadline has just passed.
+  /// @param tag Application breadcrumb; the runner passes the event index.
+  virtual void send(const event &e, std::uint64_t tag) = 0;
+
+  /// Name for the run header.
+  virtual const char *name() const = 0;
+
+  /// Optional warm-up, called during the lead-in so first-call costs (lazy
+  /// page mapping, plugin init, branch predictors) do not land on event 0.
+  virtual void warm_up() {}
+
+  /// Optional post-run summary, printed alongside the timing stats.  Never
+  /// called on the timing thread.
+  virtual void report() const {}
+
+  /// Correction bits from every `get_corrections`, one byte per bit (0 or 1),
+  /// laid out row-major as `reads x correction_width()`.  Empty for sinks that
+  /// never read any.
+  virtual const std::vector<std::uint8_t> &corrections() const {
+    static const std::vector<std::uint8_t> empty;
+    return empty;
+  }
+
+  /// Bits per read: the decoder's declared observable count.  0 when the sink
+  /// reads no corrections.
+  virtual std::size_t correction_width() const { return 0; }
+
+  /// Total syndrome bits the decoder expects per shot.  0 when unknown (null /
+  /// udp_server sinks have no local decoder to ask).
+  virtual std::size_t syndrome_size() const { return 0; }
+};
+
+/// Discards everything.  Running the same schedule against this first gives
+/// the emulator's jitter floor.
+class null_sink : public sink {
+public:
+  void send(const event &e, std::uint64_t tag) override;
+  const char *name() const override { return "null"; }
+
+  /// Kept so the compiler cannot optimize the payload read away.
+  std::uint64_t checksum() const { return checksum_; }
+
+private:
+  std::uint64_t checksum_ = 0;
+};
+
+//===----------------------------------------------------------------------===//
+// Running and reporting
+//===----------------------------------------------------------------------===//
+
+/// Per-event timing, captured into preallocated storage on the timing thread
+/// and formatted only after the run.  All three are relative to `t0`.
+struct record {
+  std::uint64_t deadline_ns; ///< Where the event was supposed to go out.
+  std::uint64_t call_ns;   ///< When the sink call began.  Lateness is
+                           ///< `call_ns - deadline_ns`: how far past its
+                           ///< deadline the record actually went out.
+  std::uint64_t return_ns; ///< When the sink call returned.  Service time is
+                           ///< `return_ns - call_ns`: how long the realtime
+                           ///< path held us.
+};
+
+/// Apply the requested real-time config.  Returns one human-readable warning
+/// per setting it could not apply.
+std::vector<std::string> apply_rt_config(const run_config &cfg);
+
+/// Sample how far past a requested wake-up `clock_nanosleep` actually returns,
+/// so `spin_slack_ns` can be derived from the machine.
+/// Returns the largest overshoot over `samples` trials, in nanoseconds.
+std::uint64_t measure_wakeup_overshoot(int samples = 200);
+
+/// Replay `events` into `dst`.  Returns one record per event, in order.
+std::vector<record> run(const std::vector<event> &events, sink &dst,
+                        const run_config &cfg);
+
+/// Lateness (`call - deadline`) and sink latency (`return - call`) are
+/// the two distributions a run produces.  Both come back ascending-sorted,
+/// one entry per record, ready to hand to `quantile()`.
+std::vector<std::uint64_t> lateness_ns(const std::vector<record> &records);
+std::vector<std::uint64_t> latency_ns(const std::vector<record> &records);
+
+/// Value at quantile `q` of an ascending-sorted distribution: 0.5 is the
+/// median, 1.0 the max.  
+std::uint64_t quantile(const std::vector<std::uint64_t> &sorted, double q);
+
+/// Events whose predecessor was still in the sink when their deadline passed
+/// -- i.e. where the schedule shifted.  Needs `records` in play order.
+std::size_t count_overruns(const std::vector<record> &records);
+
+/// Print the run summary.  `quantiles` selects the columns, as fractions;
+/// 1.0 prints as `max`.
+void print_stats(const std::vector<record> &records,
+                 const std::vector<double> &quantiles);
+
+/// Dump the raw per-event records for offline analysis.
+void write_csv(const std::string &path, const std::vector<record> &records);
+
+} // namespace cudaq::qec::emulator

@@ -1,0 +1,145 @@
+# ============================================================================ #
+# Copyright (c) 2026 NVIDIA Corporation & Affiliates.                          #
+# All rights reserved.                                                         #
+#                                                                              #
+# This source code and the accompanying materials are made available under     #
+# the terms of the Apache License 2.0 which accompanies this distribution.     #
+# ============================================================================ #
+
+# Derive a playback file from a Stim circuit, paced by the circuit's tick
+# structure.
+#
+# Two pieces, usable separately:
+#
+#   measurement_schedule(circuit)
+#       Walk the circuit and report one entry per measurement op: which tick it
+#       lands on, whether it is an ancilla read or the terminal data readout,
+#       and how wide it is.  This is the extraction on its own -- import it if
+#       you only want the schedule.
+#
+#   write_playback_from_circuit(circuit, path, shots=...)
+#       Sample the circuit with Stim and write a playback file whose tick
+#       column comes from that schedule.
+
+MEASURE_OPS = ("M", "MZ", "MX", "MY", "MR", "MRX", "MRY", "MRZ")
+
+
+class MeasurementGroup:
+    """One measurement instruction: where it lands and what it carries."""
+
+    __slots__ = ("tick", "boundary", "kind", "width", "offset")
+
+    def __init__(self, tick, boundary, kind, width, offset):
+        self.tick = tick          # segment the instruction sits in
+        self.boundary = boundary  # tick at which its result is visible
+        self.kind = kind          # "syndrome" | "data"
+        self.width = width        # measurements in this group
+        self.offset = offset      # index of its first bit in the shot record
+
+    def __repr__(self):
+        return ("MeasurementGroup(tick=%d, boundary=%d, kind=%r, width=%d, "
+                "offset=%d)" % (self.tick, self.boundary, self.kind,
+                                self.width, self.offset))
+
+
+def measurement_schedule(circuit):
+    """Per-measurement-op schedule derived from the circuit's TICK structure.
+
+    Returns (groups, total_ticks).  `groups` is in measurement-record order, so
+    concatenating their widths reproduces one shot's full record.
+    """
+    groups, tick, offset = [], 0, 0
+    for inst in circuit.flattened():
+        if inst.name == "TICK":
+            tick += 1
+            continue
+        if inst.name not in MEASURE_OPS:
+            continue
+        width = len(inst.targets_copy())
+        if width == 0:
+            raise ValueError("circuit has an empty measurement at tick %d"
+                             % tick)
+        # A measurement that also resets is an ancilla read; a bare measurement
+        # is the destructive readout.  The final group is retagged below, which
+        # is what makes a mid-circuit bare M behave sensibly.
+        kind = "syndrome" if inst.name.startswith("MR") else "data"
+        groups.append(MeasurementGroup(tick, tick, kind, width, offset))
+        offset += width
+    if not groups:
+        raise ValueError("circuit contains no measurements")
+
+    total_ticks = tick
+    for g in groups:
+        g.boundary = min(g.tick + 1, total_ticks) if total_ticks else 0
+    groups[-1].kind = "data"
+    # If the data readout shares a boundary with the preceding syndrome round
+    # (both clipped to total_ticks), give it the next tick so the two enqueues
+    # land at different deadlines and neither overruns the other by construction.
+    if len(groups) >= 2 and groups[-1].boundary == groups[-2].boundary:
+        groups[-1].boundary = total_ticks + 1
+    return groups, total_ticks
+
+
+def sample_measurements(circuit, shots, seed=None):
+    """Raw measurement records -- NOT detectors.  One row per shot."""
+    sampler = (circuit.compile_sampler(seed=seed) if seed is not None
+               else circuit.compile_sampler())
+    return sampler.sample(shots=shots)
+
+
+def write_playback_from_circuit(circuit, path, shots=100, decoder_id=0,
+                                shot_gap_ticks=None, seed=None,
+                                reset_each_shot=True, read_corrections=True,
+                                comment=None, decoder_deadline_ticks=1):
+    """Sample `circuit` and write a playback file paced by its own ticks.
+
+    decoder_deadline_ticks: ticks budgeted for the decoder to return a result,
+        counted from the last measurement boundary.  get_corrections is placed
+        at last_boundary + decoder_deadline_ticks.  Default is 1, which gives
+        the minimum one-tick separation needed to avoid same-deadline collisions
+        with the preceding enqueue.
+
+    Returns the (groups, total_ticks) schedule that was used, so a caller can
+    build a matching decoder config without re-deriving it.
+    """
+    if decoder_deadline_ticks < 1:
+        raise ValueError("decoder_deadline_ticks must be >= 1")
+    groups, total_ticks = measurement_schedule(circuit)
+    record = sum(g.width for g in groups)
+    read_tick = max(g.boundary for g in groups) + decoder_deadline_ticks
+    if shot_gap_ticks is None:
+        # Leave a shot's worth of idle between shots by default: the reset and
+        # the corrections read are request/response and block, and crowding
+        # them against the next shot's stream is the usual cause of overruns
+        # that have nothing to do with the cadence under test.
+        shot_gap_ticks = max(total_ticks, 1)
+
+    samples = sample_measurements(circuit, shots, seed)
+    span = read_tick + shot_gap_ticks
+
+    syndrome_size = sum(g.width for g in groups if g.kind == "syndrome")
+    with open(path, "w") as f:
+        f.write("# GENERATED by playback_from_circuit.py -- ticks come from "
+                "the circuit's own TICK structure\n")
+        f.write("#   <tick> <operation> <decoder_id> [operands...]\n")
+        f.write("# PLAYBACK_META decoder_id=%d syndrome_size=%d\n" %
+                (decoder_id, syndrome_size))
+        f.write("# %d measurements/shot in %d groups over %d ticks: %s\n" %
+                (record, len(groups), total_ticks,
+                 ", ".join("%s:%d@%d" % (g.kind, g.width, g.boundary)
+                           for g in groups)))
+        if comment:
+            f.write("# %s\n" % comment)
+        for shot, row in enumerate(samples):
+            base = shot * span
+            if reset_each_shot:
+                f.write("%-8d reset            %d\n" % (base, decoder_id))
+            for g in groups:
+                bits = "".join("1" if row[g.offset + i] else "0"
+                               for i in range(g.width))
+                f.write("%-8d enqueue          %d    %s\n" %
+                        (base + g.boundary, decoder_id, bits))
+            if read_corrections:
+                f.write("%-8d get_corrections  %d\n" %
+                        (base + read_tick, decoder_id))
+    return groups, total_ticks
