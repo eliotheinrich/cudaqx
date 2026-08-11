@@ -160,9 +160,7 @@ public:
 
   std::size_t correction_width() const override { return observables_; }
 
-  std::uint64_t reads_ok() const override { return reads_ok_; }
-  std::uint64_t reads_not_ready() const override { return reads_not_ready_; }
-  std::uint64_t reads_error() const override { return reads_error_; }
+  std::uint32_t last_not_ready_retries() const override { return last_not_ready_retries_; }
 
   void report() const override {
     std::printf("%-17s sent=%llu reads=%llu stalls=%llu ring_depth=%u\n",
@@ -170,10 +168,6 @@ public:
                 static_cast<unsigned long long>(sent_),
                 static_cast<unsigned long long>(reads_),
                 static_cast<unsigned long long>(stalls_), num_slots_);
-    std::printf("corrections       ok=%llu not_ready=%llu error=%llu\n",
-                static_cast<unsigned long long>(reads_ok_),
-                static_cast<unsigned long long>(reads_not_ready_),
-                static_cast<unsigned long long>(reads_error_));
   }
 
 private:
@@ -272,11 +266,11 @@ private:
     p.decoder_id = static_cast<std::int64_t>(decoder_id_);
     p.counter = static_cast<std::int64_t>(tag);
     p.syndrome_mapping_id = 0;
-    p.num_syndromes = static_cast<std::int64_t>(e.num_bits);
+    p.num_syndromes = static_cast<std::int64_t>(e.num_syndromes);
     // Streamed: publish and move on.  The reply is drained by claim() when
     // this slot comes round again -- credit discipline one lap of the ring deep.
-    publish(wire::kEnqueueSyndromesFunctionId, &p, sizeof(p), e.data,
-            e.num_bits, tag);
+    publish(wire::kEnqueueSyndromesFunctionId, &p, sizeof(p), e.syndrome_data,
+            e.num_syndromes, tag);
     ++sent_;
   }
 
@@ -287,6 +281,7 @@ private:
     p.return_size = static_cast<std::int64_t>(n);
     p.reset = 0;
 
+    last_not_ready_retries_ = 0;
     const auto deadline = std::chrono::steady_clock::now() +
                           std::chrono::milliseconds(kTimeoutMs);
     while (true) {
@@ -319,7 +314,7 @@ private:
               ", expected " + std::to_string(tag) +
               "); the host was preempted for more than one ring lap --"
               " increase --server-slots or use --wait-for-ready to recover");
-        ++reads_not_ready_;
+        ++last_not_ready_retries_;
         if (std::chrono::steady_clock::now() >= deadline)
           throw std::runtime_error("remote_sink: wait_for_ready timed out after " +
                                    std::to_string(kTimeoutMs) + " ms");
@@ -328,7 +323,7 @@ private:
       }
 
       if (response->status == static_cast<int32_t>(wire::RpcStatus::NOT_READY)) {
-        ++reads_not_ready_;
+        ++last_not_ready_retries_;
         if (!wait_for_ready_)
           throw std::runtime_error(
               "remote_sink: get_corrections returned NOT_READY "
@@ -341,11 +336,9 @@ private:
         continue;
       }
       if (response->status != 0) {
-        ++reads_error_;
         throw std::runtime_error("remote_sink: get_corrections returned status " +
                                  std::to_string(response->status));
       }
-      ++reads_ok_;
       const std::uint8_t *packed =
           rx_slot + sizeof(cudaq::realtime::RPCResponse);
       for (std::uint64_t i = 0; i < n; ++i)
@@ -372,7 +365,7 @@ private:
   std::uint64_t observables_;
   std::uint32_t num_slots_ = 0, slot_size_ = 0, cursor_ = 0;
   std::uint64_t sent_ = 0, reads_ = 0, stalls_ = 0;
-  std::uint64_t reads_ok_ = 0, reads_not_ready_ = 0, reads_error_ = 0;
+  std::uint32_t last_not_ready_retries_ = 0;
   std::vector<std::uint8_t> corrections_log_;
 };
 

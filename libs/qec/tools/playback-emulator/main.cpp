@@ -233,9 +233,9 @@ int main(int argc, char **argv) try {
                  static_cast<unsigned long long>(meta_it->second.syndrome_size),
                  static_cast<unsigned long long>(dst->syndrome_size()));
 
-  std::printf("playback %s: %zu records, %zu bits\n",
+  std::printf("playback %s: %zu records, %zu syndrome bits\n",
               opts.playback_file.c_str(), file.records.size(),
-              file.bits.size());
+              file.syndromes.size());
   std::printf("tick     %s = %llu ns\n", opts.tick.c_str(),
               static_cast<unsigned long long>(opts.tick_ns));
   std::printf("decoder  %zu: %zu events spanning %llu ns (%zu records skipped "
@@ -254,15 +254,25 @@ int main(int argc, char **argv) try {
   print_stats(records, opts.quantiles);
   dst->report();
 
-  const auto [n_expected, n_mismatch] =
-      count_correction_mismatches(events, *dst);
+  std::size_t n_expected = 0, n_mismatch = 0, total_retries = 0;
+  for (const auto &r : records) {
+    total_retries += r.not_ready_retries;
+    if (r.correction_mismatch) ++n_mismatch;
+  }
+  for (const auto &e : events)
+    if (e.op == operation::get_corrections && e.corrections_data != nullptr)
+      ++n_expected;
   if (n_expected > 0)
     std::printf("corrections       expected=%zu mismatches=%zu (%.1f%%)\n",
                 n_expected, n_mismatch,
                 n_expected ? 100.0 * n_mismatch / n_expected : 0.0);
+  if (total_retries > 0)
+    std::printf("not_ready retries %llu total\n",
+                static_cast<unsigned long long>(total_retries));
 
   if (!opts.csv_file.empty()) {
-    write_csv(opts.csv_file, records);
+    write_csv(opts.csv_file, records, events,
+              dst->corrections(), dst->correction_width());
     std::printf("per-event records written to %s\n", opts.csv_file.c_str());
   }
   return 0;

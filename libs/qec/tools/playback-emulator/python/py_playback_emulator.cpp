@@ -55,10 +55,8 @@ struct playback_result {
   std::size_t reads_with_expected = 0;
   std::size_t correction_mismatches = 0;
 
-  /// Per-call outcome counts for get_corrections.
-  std::uint64_t reads_ok = 0;
-  std::uint64_t reads_not_ready = 0;
-  std::uint64_t reads_error = 0;
+  /// Total NOT_READY retries across all get_corrections events.
+  std::uint64_t not_ready_retries = 0;
 };
 
 // sentinel: spin_slack_ns == 0 means "calibrate automatically"
@@ -138,14 +136,16 @@ playback_result run_playback(const std::string &playback,
   out.latency = latency_ns(records);
   out.corrections = dst->corrections();
   out.correction_width = dst->correction_width();
-  out.reads_ok = dst->reads_ok();
-  out.reads_not_ready = dst->reads_not_ready();
-  out.reads_error = dst->reads_error();
-  const auto [n_exp, n_mis] = count_correction_mismatches(events, *dst);
-  out.reads_with_expected = n_exp;
-  out.correction_mismatches = n_mis;
+  for (const auto &r : records) {
+    out.not_ready_retries += r.not_ready_retries;
+    if (r.correction_mismatch) ++out.correction_mismatches;
+  }
+  for (const auto &e : events)
+    if (e.op == operation::get_corrections && e.corrections_data != nullptr)
+      ++out.reads_with_expected;
   if (!csv_file.empty())
-    write_csv(csv_file, records);
+    write_csv(csv_file, records, events,
+              dst->corrections(), dst->correction_width());
   return out;
 }
 
@@ -187,12 +187,8 @@ NB_MODULE(qec_playback_emulator, m) {
               "playback file.")
       .def_ro("correction_mismatches", &playback_result::correction_mismatches,
               "Reads where actual corrections differed from expected.")
-      .def_ro("reads_ok", &playback_result::reads_ok,
-              "get_corrections calls that returned OK.")
-      .def_ro("reads_not_ready", &playback_result::reads_not_ready,
-              "get_corrections calls that returned NOT_READY.")
-      .def_ro("reads_error", &playback_result::reads_error,
-              "get_corrections calls that returned an error status.");
+      .def_ro("not_ready_retries", &playback_result::not_ready_retries,
+              "Total NOT_READY retries across all get_corrections events.");
 
   m.def("run_playback", &run_playback, nb::arg("playback"),
         nb::arg("sink") = "null", nb::arg("config") = "",
@@ -218,7 +214,8 @@ explicit value to override.
 
 wait_for_ready: when True, get_corrections retries on NOT_READY until the
 decoder responds OK or times out.  Use to separate "decoder too slow" from
-"schedule too tight" without rewriting the playback file.
+"schedule too tight".  Retry counts are visible per-event in
+`not_ready_retries` (total across the run).
 
 csv: path to write per-event timing records (deadline_ns, lateness_ns, etc.).
 Empty string (default) disables CSV output.

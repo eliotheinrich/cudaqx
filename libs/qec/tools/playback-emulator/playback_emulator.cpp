@@ -282,16 +282,16 @@ playback_file load_playback(const std::string &path) {
       std::string bits_text;
       if (!(fields >> bits_text))
         fail(std::string(to_string(rec.op)) + " needs a syndrome bit string");
-      rec.bit_offset = file.bits.size();
+      rec.syndrome_offset = file.syndromes.size();
       for (const char c : bits_text) {
         if (c != '0' && c != '1')
           fail(std::string("syndrome data must be `0`/`1` characters, got `") +
                c + "` in: " + bits_text);
-        file.bits.push_back(static_cast<std::uint8_t>(c - '0'));
+        file.syndromes.push_back(static_cast<std::uint8_t>(c - '0'));
       }
-      rec.bit_count = bits_text.size();
-      if (rec.bit_count > kMaxSyndromeBits)
-        fail("syndrome is " + std::to_string(rec.bit_count) +
+      rec.syndrome_count = bits_text.size();
+      if (rec.syndrome_count > kMaxSyndromeBits)
+        fail("syndrome is " + std::to_string(rec.syndrome_count) +
              " bits, over the " +
              std::to_string(kMaxSyndromeBits) +
              "-bit wire cap");
@@ -305,14 +305,14 @@ playback_file load_playback(const std::string &path) {
       if (rec.op != operation::get_corrections)
         fail("unexpected trailing operand `" + extra + "` for " +
              to_string(rec.op));
-      rec.expected_offset = file.expected_bits.size();
+      rec.corrections_offset = file.corrections.size();
       for (const char c : extra) {
         if (c != '0' && c != '1')
           fail(std::string("expected correction bits must be `0`/`1`, got `") +
                c + "` in: " + extra);
-        file.expected_bits.push_back(static_cast<std::uint8_t>(c - '0'));
+        file.corrections.push_back(static_cast<std::uint8_t>(c - '0'));
       }
-      rec.expected_count = extra.size();
+      rec.corrections_count = extra.size();
     }
 
     file.records.push_back(rec);
@@ -361,11 +361,13 @@ std::vector<event> build_events(const playback_file &file,
     }
     seen = true;
 
-    const std::uint8_t *data =
-        takes_syndromes(rec.op) ? file.bits.data() + rec.bit_offset : nullptr;
-    const std::uint8_t *expected =
-        rec.expected_count > 0
-            ? file.expected_bits.data() + rec.expected_offset
+    const std::uint8_t *syndrome_data =
+        takes_syndromes(rec.op)
+            ? file.syndromes.data() + rec.syndrome_offset
+            : nullptr;
+    const std::uint8_t *corrections_data =
+        rec.corrections_count > 0
+            ? file.corrections.data() + rec.corrections_offset
             : nullptr;
     // Ticks become nanoseconds HERE, once, alongside the prefix sum -- the run
     // loop never multiplies, and a late wake-up cannot accumulate.
@@ -373,8 +375,8 @@ std::vector<event> build_events(const playback_file &file,
       throw std::runtime_error(
           "build_events: tick " + std::to_string(offset) + " x " +
           std::to_string(tick_ns) + " ns overflows the schedule");
-    events.push_back(
-        {rec.op, data, rec.bit_count, offset * tick_ns, expected, rec.expected_count});
+    events.push_back({rec.op, syndrome_data, rec.syndrome_count,
+                      offset * tick_ns, corrections_data, rec.corrections_count});
   }
 
   if (events.empty())
@@ -397,8 +399,8 @@ void null_sink::send(const event &e, std::uint64_t tag) {
   // jitter floor this sink exists to measure.  `reset` and `get_corrections`
   // carry no payload, so guard the dereference.
   checksum_ += tag + static_cast<std::uint64_t>(e.op);
-  if (e.data != nullptr && e.num_bits > 0)
-    checksum_ += e.data[0] + e.data[e.num_bits - 1];
+  if (e.syndrome_data != nullptr && e.num_syndromes > 0)
+    checksum_ += e.syndrome_data[0] + e.syndrome_data[e.num_syndromes - 1];
 }
 
 //===----------------------------------------------------------------------===//
@@ -441,8 +443,8 @@ std::uint64_t measure_wakeup_overshoot(int samples) {
 
 std::vector<record> run(const std::vector<event> &events, sink &dst,
                         const run_config &cfg) {
-  // Allocated and fully written before t0 so no page in it faults mid-run.
-  std::vector<record> records(events.size(), record{0, 0, 0});
+  // Allocated and zero-initialised before t0 so no page faults mid-run.
+  std::vector<record> records(events.size());
 
   dst.set_wait_for_ready(cfg.wait_for_ready);
   const std::uint64_t t0 = now_ns() + cfg.lead_in_ns;
@@ -451,6 +453,9 @@ std::vector<record> run(const std::vector<event> &events, sink &dst,
   // for ~lead_in_ns, and long sleeps overshoot by more than spin_slack
   // (calibrated on short samples), making every event late by a fixed offset.
   wait_until(t0, cfg.spin_slack_ns);
+
+  std::size_t read_count = 0;
+  const std::size_t width = dst.correction_width();
 
   for (std::size_t i = 0; i < events.size(); ++i) {
     const event &e = events[i];
@@ -465,7 +470,33 @@ std::vector<record> run(const std::vector<event> &events, sink &dst,
     dst.send(e, i);
     const std::uint64_t returned = now_ns();
 
-    records[i] = {e.offset_ns, call - t0, returned - t0};
+    record &r = records[i];
+    r.deadline_ns = e.offset_ns;
+    r.call_ns     = call - t0;
+    r.return_ns   = returned - t0;
+
+    if (e.op == operation::get_corrections) {
+      r.not_ready_retries = dst.last_not_ready_retries();
+      if (e.corrections_data != nullptr) {
+        if (width == 0 || e.corrections_count != width) {
+          r.correction_mismatch = true;
+        } else {
+          const auto &corr = dst.corrections();
+          const std::size_t base = read_count * width;
+          if (base + width > corr.size()) {
+            r.correction_mismatch = true;
+          } else {
+            for (std::size_t j = 0; j < width; ++j) {
+              if ((corr[base + j] & 1u) != (e.corrections_data[j] & 1u)) {
+                r.correction_mismatch = true;
+                break;
+              }
+            }
+          }
+        }
+      }
+      ++read_count;
+    }
   }
   return records;
 }
@@ -537,52 +568,40 @@ void print_stats(const std::vector<record> &records,
   }
 }
 
-void write_csv(const std::string &path, const std::vector<record> &records) {
+void write_csv(const std::string &path,
+               const std::vector<record> &records,
+               const std::vector<event> &events,
+               const std::vector<std::uint8_t> &corrections,
+               std::size_t correction_width) {
   std::ofstream out(path);
   if (!out)
     throw std::runtime_error("write_csv: cannot open " + path);
-  out << "event,deadline_ns,call_ns,return_ns,lateness_ns,latency_ns\n";
+  out << "event,op,deadline_ns,call_ns,return_ns,lateness_ns,latency_ns,"
+         "correction\n";
+  std::size_t read_idx = 0;
   for (std::size_t i = 0; i < records.size(); ++i) {
     const auto &r = records[i];
+    const auto  op = events[i].op;
     const std::uint64_t late =
         r.call_ns > r.deadline_ns ? r.call_ns - r.deadline_ns : 0;
-    out << i << ',' << r.deadline_ns << ',' << r.call_ns << ','
-        << r.return_ns << ',' << late << ',' << (r.return_ns - r.call_ns)
-        << '\n';
-  }
-}
-
-std::pair<std::size_t, std::size_t>
-count_correction_mismatches(const std::vector<event> &events, const sink &dst) {
-  const std::size_t width = dst.correction_width();
-  const auto &actual = dst.corrections();
-  std::size_t reads_with_expected = 0;
-  std::size_t mismatches = 0;
-  std::size_t read_index = 0;
-
-  for (const auto &e : events) {
-    if (e.op != operation::get_corrections) continue;
-    if (e.expected_data != nullptr) {
-      ++reads_with_expected;
-      // A width mismatch is itself a mismatch.
-      if (width == 0 || e.expected_count != width) {
-        ++mismatches;
+    out << i << ',' << to_string(op) << ','
+        << r.deadline_ns << ',' << r.call_ns << ','
+        << r.return_ns   << ',' << late      << ',' << (r.return_ns - r.call_ns)
+        << ',';
+    if (op == operation::get_corrections && correction_width > 0) {
+      const std::size_t base = read_idx * correction_width;
+      if (base + correction_width <= corrections.size()) {
+        for (std::size_t j = 0; j < correction_width; ++j)
+          out << static_cast<int>(corrections[base + j] & 1u);
       } else {
-        const std::size_t base = read_index * width;
-        if (base + width > actual.size()) {
-          ++mismatches; // corrections not available for this read
-        } else {
-          for (std::size_t i = 0; i < width; ++i)
-            if ((actual[base + i] & 0x1u) != (e.expected_data[i] & 0x1u)) {
-              ++mismatches;
-              break;
-            }
-        }
+        out << '-';
       }
+      ++read_idx;
+    } else {
+      out << '-';
     }
-    ++read_index;
+    out << '\n';
   }
-  return {reads_with_expected, mismatches};
 }
 
 } // namespace cudaq::qec::emulator

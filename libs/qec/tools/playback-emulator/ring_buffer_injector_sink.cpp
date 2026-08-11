@@ -182,16 +182,15 @@ public:
       // publish the request and watch the TX doorbell exactly as reclaim()
       // already watches it, so the wait costs the ring turnaround (~2 us)
       // instead of rpc_producer's 200 us poll granularity.
+      last_not_ready_retries_ = 0;
       const auto deadline = std::chrono::steady_clock::now() +
                             std::chrono::milliseconds(kReclaimTimeoutMs);
       while (true) {
         const auto status = native_round_trip(e, /*is_read=*/true);
-        if (status == 0) {
-          ++reads_ok_;
+        if (status == 0)
           return;
-        }
         if (status == static_cast<int32_t>(wire::RpcStatus::NOT_READY)) {
-          ++reads_not_ready_;
+          ++last_not_ready_retries_;
           if (!wait_for_ready_)
             throw std::runtime_error(
                 "ring_buffer_injector_sink: get_corrections returned NOT_READY "
@@ -204,7 +203,6 @@ public:
           CUDAQ_REALTIME_CPU_RELAX();
           continue;
         }
-        ++reads_error_;
         throw std::runtime_error(
             "ring_buffer_injector_sink: get_corrections returned status " +
             std::to_string(status));
@@ -224,10 +222,7 @@ public:
 
   std::size_t correction_width() const override { return num_observables_; }
   std::size_t syndrome_size() const override { return syndrome_size_; }
-
-  std::uint64_t reads_ok() const override { return reads_ok_; }
-  std::uint64_t reads_not_ready() const override { return reads_not_ready_; }
-  std::uint64_t reads_error() const override { return reads_error_; }
+  std::uint32_t last_not_ready_retries() const override { return last_not_ready_retries_; }
 
   void report() const override {
     if (corrections_read_) {
@@ -249,10 +244,6 @@ public:
                             static_cast<double>(sent_)
                       : 0.0,
                 static_cast<unsigned long long>(rpc_errors_), num_slots_);
-    std::printf("corrections       ok=%llu not_ready=%llu error=%llu\n",
-                static_cast<unsigned long long>(reads_ok_),
-                static_cast<unsigned long long>(reads_not_ready_),
-                static_cast<unsigned long long>(reads_error_));
   }
 
 private:
@@ -422,7 +413,7 @@ private:
 
   void write_frame(std::uint32_t slot, const event &e, std::uint64_t tag) {
     std::uint8_t *rx_slot = session_->rx_data_host() + slot * slot_size_;
-    const std::size_t bp_bytes = wire::bit_packed_bytes(e.num_bits);
+    const std::size_t bp_bytes = wire::bit_packed_bytes(e.num_syndromes);
     const std::size_t body = sizeof(wire::EnqueueRequestPayload) + bp_bytes;
 
     std::memset(rx_slot, 0, sizeof(cudaq::realtime::RPCHeader) + body);
@@ -439,13 +430,13 @@ private:
     p->decoder_id = static_cast<std::int64_t>(kWireDecoderId);
     p->counter = static_cast<std::int64_t>(tag);
     p->syndrome_mapping_id = 0;
-    p->num_syndromes = static_cast<std::int64_t>(e.num_bits);
+    p->num_syndromes = static_cast<std::int64_t>(e.num_syndromes);
 
     // Source is one bit per byte; the wire wants them packed LSB-first.
     std::uint8_t *bits = reinterpret_cast<std::uint8_t *>(p) +
                          sizeof(wire::EnqueueRequestPayload);
-    for (std::uint64_t i = 0; i < e.num_bits; ++i)
-      if (e.data[i] & 0x1u)
+    for (std::uint64_t i = 0; i < e.num_syndromes; ++i)
+      if (e.syndrome_data[i] & 0x1u)
         bits[i / 8] |= static_cast<std::uint8_t>(1u << (i % 8));
 
     __sync_synchronize();
@@ -473,9 +464,7 @@ private:
   std::uint64_t rpc_errors_ = 0;
 
   // ---- read outcome counters ----
-  std::uint64_t reads_ok_ = 0;
-  std::uint64_t reads_not_ready_ = 0;
-  std::uint64_t reads_error_ = 0;
+  std::uint32_t last_not_ready_retries_ = 0;
 };
 
 } // namespace
