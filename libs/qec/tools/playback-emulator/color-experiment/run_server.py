@@ -66,16 +66,17 @@ print("decoding_server ready on port %d" % port)
 # udp_server sink sends the same reset/enqueue/get_corrections frames over
 # UDP to the server instead of an in-process session.
 
-r = pe.run_playback(
-    playback           = os.path.join(HERE, "playback.txt"),
-    sink               = "udp_server",
-    server_port        = port,
-    server_observables = 1,
-    tick               = "50us",
-)
-
-proc.terminate()
-proc.wait()
+try:
+    r = pe.run_playback(
+        playback           = os.path.join(HERE, "playback.txt"),
+        sink               = "udp_server",
+        server_port        = port,
+        server_observables = 1,
+        tick               = "50us",
+    )
+finally:
+    proc.terminate()
+    proc.wait()
 
 
 # ── Scoring ───────────────────────────────────────────────────────────────────

@@ -22,7 +22,7 @@ import qec_playback_emulator as pe
 import numpy as np
 
 HERE  = os.path.dirname(os.path.abspath(__file__))
-SINKS = ("inproc_rpc", "ring_buffer_injector")
+SINKS = ("ring_buffer_injector",)
 
 truth = np.load(os.path.join(HERE, "truth.npy"))
 shots = len(truth)
@@ -31,10 +31,7 @@ shots = len(truth)
 # ── Playback Emulator ─────────────────────────────────────────────────────────
 #
 # run_playback drives the timing loop and returns corrections for each shot.
-# Two sinks exercise the same in-process session via different producer paths:
-#
-#   inproc_rpc           one ACK-waited RPC per enqueue — correct but slow
-#   ring_buffer_injector writes wire frames directly — realistic 1 µs cadence
+# ring_buffer_injector writes wire frames directly — realistic 1 µs cadence.
 
 results = {}
 for sink in SINKS:
@@ -59,5 +56,3 @@ for sink, r in results.items():
           % (sink, r.events, r.overruns, r.latency(0.5),
              wrong, shots, 100.0 * wrong / shots))
 
-a, b = (results[s].corrections for s in SINKS)
-print("\nproducer paths agree:", a == b)

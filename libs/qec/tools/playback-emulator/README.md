@@ -46,7 +46,6 @@ then reports how accurately it hit that schedule.
             ┌──────────────────────────────────────────────────┘
             │  sink (chosen at startup)
             ├─ null_sink            discard; pure timing floor
-            ├─ inproc_rpc_sink      rpc_producer → in-process
             ├─ ring_buffer_injector write directly into ring → in-process
             └─ udp_server_sink      UDP transport → decoding_server
 ```
@@ -58,10 +57,10 @@ only work on the timing thread is the sleep+spin and one `sink.send()` call.
 Deadlines are absolute offsets from `t0`, computed once. A late wake-up shifts
 only the event that caused it, not all subsequent ones.
 
-**Sink choice.**  The `null` sink gives the jitter floor with no decoder in the path.  
-The two in-process sinks (`inproc_rpc` and `ring_buffer_injector`) drive a local 
-`qec_realtime_session` and measure the realtime decode path end-to-end.  `udp_server` 
-sends events to a realtime decoding server at the specified address/port.
+**Sink choice.**  The `null` sink gives the jitter floor with no decoder in the path.
+`ring_buffer_injector` drives a local `qec_realtime_session` and measures the realtime
+decode path end-to-end.  `udp_server` sends events to a realtime decoding server at
+the specified address/port.
 
 One emulator process per decoder source; multiple sources sharing one playback file 
 are distinguished by `decoder_id`.
@@ -151,8 +150,8 @@ qec_playback_emulator --playback=my.txt --tick=1us \
 |------|---------|-------------|
 | `--playback=<file>` | *(required)* | Playback file to replay. |
 | `--tick=<dur>` | *(required)* | Wall-clock duration of one tick (e.g. `1us`, `500ns`, `2.5ms`). |
-| `--sink=<name>` | `null` | `null` — timing only; `inproc_rpc` — in-process, waits for each ACK; `ring_buffer_injector` — in-process, full ring depth; `udp_server` — send events to a remote `decoding_server`. |
-| `--config=<file>` | | Decoder YAML config (required for `inproc_rpc` / `ring_buffer_injector`). |
+| `--sink=<name>` | `null` | `null` — timing only; `ring_buffer_injector` — in-process, full ring depth; `udp_server` — send events to a remote `decoding_server`. |
+| `--config=<file>` | | Decoder YAML config (required for `ring_buffer_injector`). |
 | `--dem=<file>` | | DEM file for chromobius (alternative to `--config`). |
 | `--decoder-id=N` | `0` | Which decoder entry in `--config` to load; also selects records from the playback file. |
 | `--delta-ticks` | | Treat timestamps as inter-event gaps rather than absolute offsets from `t0`. |
@@ -163,7 +162,7 @@ qec_playback_emulator --playback=my.txt --tick=1us \
 | `--percentiles=A,B,...` | `50,90,99,99.9,100` | Lateness percentiles to print at the end of the run. |
 | `--server-host=H` | `127.0.0.1` | `udp_server`: decoding_server hostname. |
 | `--server-port=N` | *(required for udp_server)* | `udp_server`: port from the server's `QEC_DECODING_SERVER_READY` line. |
-| `--server-slots=N` | `8` | `udp_server`: number of ring-buffer slots. |
+| `--server-slots=N` | `8` | `udp_server`: number of ring-buffer slots (must match `decoding_server --num-slots`). **If you see "timed out awaiting … response in slot N" on a jittery host (WSL2, VM, shared cloud node), increase this first** — try doubling it (`--server-slots=16` + `decoding_server --num-slots=16`). Stalls that let the client outpace the server by more than one ring lap exhaust the ring before a response can arrive. |
 | `--server-slot-size=N` | `256` | `udp_server`: bytes per slot. |
 | `--server-observables=N` | `1` | `udp_server`: number of logical observable bits returned per `get_corrections`. |
 

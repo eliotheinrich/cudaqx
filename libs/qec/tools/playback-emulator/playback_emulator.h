@@ -37,17 +37,40 @@ namespace cudaq::qec::emulator {
 // Configuration
 //===----------------------------------------------------------------------===//
 
-/// Real-time pacing knobs.  
+/// Real-time pacing knobs.
 struct run_config {
   /// How long before each deadline to stop sleeping and start watching the
   /// clock.  The runner sleeps off the bulk of the gap and spins only the last
-  /// stretch
+  /// stretch.
   std::uint64_t spin_slack_ns = 100'000;
-  /// Gap between `run()` being called and `t0`.  Gives the caches and the sink 
-  // a moment to settle.
+  /// Gap between `run()` being called and `t0`.  Gives the caches and the sink
+  /// a moment to settle.
   std::uint64_t lead_in_ns = 50'000'000;
   /// Core to pin the timing thread to, or -1 for no affinity change.
   int pin_cpu = -1;
+  /// Retry policy for `get_corrections` when the decoder answers NOT_READY.
+  ///
+  /// The decoder session has a simple state machine: `collecting` while it
+  /// accumulates syndrome bits, then `result_ready` once enough have arrived
+  /// and the decode has completed.  A `get_corrections` RPC that arrives while
+  /// the session is still `collecting` returns NOT_READY.  This happens when
+  /// the playback schedule fires `get_corrections` before the decoder has
+  /// finished -- either the timing budget is too tight or the decoder itself
+  /// is slow.
+  ///
+  /// Default (false): NOT_READY is treated as an error.  The sink increments
+  /// `reads_not_ready()` and throws, aborting the run.  This is the right
+  /// choice for a correctly sized schedule: it surfaces misconfiguration
+  /// loudly rather than silently returning stale corrections.
+  ///
+  /// True: the sink spins retrying (within `kReclaimTimeoutMs`) until the
+  /// session transitions to `result_ready`.  The timing thread blocks past
+  /// its original deadline, so latency and overrun stats reflect the extra
+  /// wait.  Use this to separate "decoder is inherently too slow for this
+  /// schedule" from "the schedule is slightly too tight but the decoder
+  /// eventually catches up".  `reads_not_ready()` counts each retry attempt,
+  /// so you can see how many times the decoder was polled before it was ready.
+  bool wait_for_ready = false;
 };
 
 //===----------------------------------------------------------------------===//
@@ -83,12 +106,19 @@ struct run_config {
 //       characters, one per syndrome bit, no separators.  Fire-and-forget on
 //       the wire: the dispatcher ACKs but returns no body.
 //
-//   get_corrections
+//   get_corrections [expected_bits]
 //       Read back the accumulated corrections.  Always returns the decoder's
 //       declared observable count -- that is the only width it accepts -- and
 //       never resets.  Follow it with an explicit `reset` when a shot boundary
 //       needs the accumulator cleared, so that clearing is visible in the file
 //       rather than hidden in a flag.
+//
+//       `expected_bits` is an OPTIONAL run of `0`/`1` characters, one per
+//       observable, written immediately after the decoder_id column.  When
+//       present, `count_correction_mismatches` compares each read's actual
+//       corrections against those bits and reports the mismatch count.  The
+//       timing loop never reads or acts on expected_bits; they are advisory
+//       and evaluated only after the run completes.
 //
 //   reset
 //       Clear the decoder's queued syndromes and zero its corrections.
@@ -101,7 +131,8 @@ struct run_config {
 //     1         enqueue          0    010
 //     2         enqueue          0    110
 //     2         enqueue          1    001
-//     3         get_corrections  0
+//     3         get_corrections  0                 # no expectation
+//     3         get_corrections  0    10           # expected: obs0=1 obs1=0
 //     4         reset            0
 //
 //===----------------------------------------------------------------------===//
@@ -118,14 +149,25 @@ bool takes_syndromes(operation op);
 /// True when `op` reads a result back, and so must wait for its response.
 bool returns_corrections(operation op);
 
-/// One parsed record.  The syndrome bits live in the file's shared arena rather
-/// than in the record, so a record stays small and the bits stay contiguous.
+/// One parsed record.  The syndrome bits (and any expected correction bits)
+/// live in the file's shared arenas rather than in the record, so a record
+/// stays small and the bits stay contiguous.
 struct playback_record {
   std::uint64_t tick;
   operation op;
   std::uint64_t decoder_id;
-  std::size_t bit_offset;  ///< Index into `playback_file::bits`.
-  std::uint64_t bit_count; ///< 0 unless `takes_syndromes(op)`.
+  /// Syndrome bits: index into `playback_file::bits` and byte count.
+  /// Both are 0 for non-enqueue records.
+  std::size_t bit_offset;
+  std::uint64_t bit_count;
+  /// Optional expected correction bits, parallel to the syndrome bit fields.
+  /// `expected_offset` is an index into `playback_file::expected_bits`;
+  /// `expected_count` is the number of bytes (one byte per observable bit,
+  /// same layout as `sink::corrections()`).  Both are 0 unless
+  /// `op == get_corrections` AND the playback file carried a bit string on
+  /// that line.
+  std::size_t expected_offset;
+  std::uint64_t expected_count;
 };
 
 /// Metadata parsed from `# PLAYBACK_META` header lines.  Zero means "not
@@ -139,7 +181,8 @@ struct playback_meta {
 /// the shape `rpc_producer::enqueue_syndromes` wants, so the send path copies
 /// nothing -- the payloads are sliced once, here, before the run starts.
 struct playback_file {
-  std::vector<std::uint8_t> bits;
+  std::vector<std::uint8_t> bits;          ///< Syndrome bit arena.
+  std::vector<std::uint8_t> expected_bits; ///< Expected correction bit arena.
   std::vector<playback_record> records;
   std::map<std::uint64_t, playback_meta> meta; ///< Keyed by decoder_id.
 };
@@ -151,14 +194,21 @@ struct event {
   operation op;
   const std::uint8_t *data; ///< Into `playback_file::bits`.  One bit per BYTE
                             ///< (0x00 / 0x01), which is the shape
-                            ///< `rpc_producer::enqueue_syndromes` wants, so the
-                            ///< send path copies nothing.  Null unless
-                            ///< `takes_syndromes(op)`.
+                            ///< `rpc_producer::enqueue_syndromes` wants
+                            ///< Null unless `takes_syndromes(op)`.
   std::uint64_t num_bits;   ///< Syndrome bits, matching `record::bit_count`.
                             ///< Equal to the byte length of `data` only because
                             ///< of the one-bit-per-byte layout -- it is a BIT
                             ///< count, and goes on the wire as such.
   std::uint64_t offset_ns;
+  /// Optional expected correction bits, populated from `playback_record::
+  /// expected_offset/expected_count`.  Null (and expected_count == 0) for
+  /// every event except get_corrections events whose playback record carried
+  /// expected bits.  One byte per observable (0x00/0x01), same layout as
+  /// `sink::corrections()`.  The run loop never reads these; they are only
+  /// used by `count_correction_mismatches` after the run completes.
+  const std::uint8_t *expected_data = nullptr;
+  std::uint64_t expected_count = 0;
 };
 
 /// Parse a playback file.  Throws `std::runtime_error` naming the file and line
@@ -238,6 +288,29 @@ public:
   /// Total syndrome bits the decoder expects per shot.  0 when unknown (null /
   /// udp_server sinks have no local decoder to ask).
   virtual std::size_t syndrome_size() const { return 0; }
+
+  /// Per-call outcome counts for `get_corrections` across the whole run.
+  ///
+  /// `reads_ok()`: calls that received a well-formed correction vector.
+  ///
+  /// `reads_not_ready()`: calls (or retry attempts, when wait_for_ready is
+  /// set) where the decoder answered NOT_READY.  Without wait_for_ready, this
+  /// is at most 1 per failed event, because the first NOT_READY throws and
+  /// aborts the run.  With wait_for_ready, it counts every retry, so a single
+  /// get_corrections event can contribute multiple counts here before the
+  /// decoder finally responds OK.
+  ///
+  /// `reads_error()`: calls that received any other non-zero status
+  /// (INTERNAL_ERROR, BAD_REQUEST, SYNDROMES_DROPPED, ...).
+  virtual std::uint64_t reads_ok() const { return 0; }
+  virtual std::uint64_t reads_not_ready() const { return 0; }
+  virtual std::uint64_t reads_error() const { return 0; }
+
+  /// Set the NOT_READY retry policy for this sink.
+  void set_wait_for_ready(bool v) { wait_for_ready_ = v; }
+
+protected:
+  bool wait_for_ready_ = false;
 };
 
 /// Discards everything.  Running the same schedule against this first gives
@@ -304,5 +377,14 @@ void print_stats(const std::vector<record> &records,
 
 /// Dump the raw per-event records for offline analysis.
 void write_csv(const std::string &path, const std::vector<record> &records);
+
+/// Compare expected correction bits (from the playback file) against the
+/// corrections the sink actually produced.  Returns {reads_with_expected,
+/// mismatches}: `reads_with_expected` counts get_corrections events that
+/// carried expected bits; `mismatches` counts those whose actual corrections
+/// differed.  A width mismatch (expected_count != correction_width) is also
+/// counted as a mismatch.  
+std::pair<std::size_t, std::size_t>
+count_correction_mismatches(const std::vector<event> &events, const sink &dst);
 
 } // namespace cudaq::qec::emulator

@@ -11,7 +11,7 @@
 /// realtime decoding API on a user-supplied schedule.
 ///
 /// Usage:
-///   qec_playback_emulator --playback=<file> [--sink=null|inproc_rpc|ring_buffer_injector]
+///   qec_playback_emulator --playback=<file> [--sink=null|ring_buffer_injector]
 ///                         [--config=<decoders.yaml>] [--decoder-id=N]
 ///                         [--delta-timestamps]
 ///                         [--spin-slack-ns=N]
@@ -24,8 +24,12 @@
 /// `--decoder-id` selects both which decoder in `--config` to realize and which
 /// records to play; records for other decoders are skipped, so ONE playback
 /// file can drive a whole multi-source experiment with one process per decoder.
+///
+/// If `get_corrections` records in the playback file carry expected correction
+/// bits (e.g. `500 get_corrections 0 0110`), the emulator reports a mismatch
+/// count after the run without stopping the timing loop.
 
-#include "session_sink.h"
+#include "sinks.h"
 #include "playback_emulator.h"
 
 #include <cstdio>
@@ -65,8 +69,7 @@ struct options {
   std::fprintf(
       code ? stderr : stdout,
       "usage: qec_playback_emulator --playback=<file>\n"
-      "                           [--sink=null|inproc_rpc|ring_buffer_injector|\n"
-      "                                   udp_server]\n"
+      "                           [--sink=null|ring_buffer_injector|udp_server]\n"
       "                           [--server-host=H] [--server-port=N]\n"
       "                           [--server-slots=N] [--server-slot-size=N]\n"
       "                           [--server-observables=N]\n"
@@ -77,7 +80,8 @@ struct options {
       "                           [--lead-in-ns=N] [--cpu=N]\n"
       "                           [--csv=<out.csv>]\n"
       "                           [--percentiles=50,90,99,99.9,100]\n"
-      "                           [--dem=<model.dem>]  (chromobius)\n");
+      "                           [--dem=<model.dem>]  (chromobius)\n"
+      "                           [--wait-for-ready]\n");
   std::exit(code);
 }
 
@@ -143,6 +147,8 @@ options parse_args(int argc, char **argv) {
       opts.tick = value;
     else if (arg == "--delta-ticks" || arg == "--delta-timestamps")
       opts.deltas = true;
+    else if (arg == "--wait-for-ready")
+      opts.run.wait_for_ready = true;
     else {
       std::fprintf(stderr, "unknown argument: %s\n", arg.c_str());
       usage(1);
@@ -204,8 +210,6 @@ int main(int argc, char **argv) try {
   std::unique_ptr<sink> dst;
   if (opts.sink_name == "null")
     dst = std::make_unique<null_sink>();
-  else if (opts.sink_name == "inproc_rpc")
-    dst = make_inproc_rpc_sink(opts.config_file, opts.decoder_id, opts.dem_file);
   else if (opts.sink_name == "ring_buffer_injector")
     dst = make_ring_buffer_injector_sink(opts.config_file, opts.decoder_id,
                                        opts.dem_file);
@@ -239,15 +243,24 @@ int main(int argc, char **argv) try {
               opts.decoder_id, events.size(),
               static_cast<unsigned long long>(events.back().offset_ns),
               skipped);
-  std::printf("sink=%s slack=%llu ns lead-in=%llu ns\n", dst->name(),
+  std::printf("sink=%s slack=%llu ns lead-in=%llu ns%s\n", dst->name(),
               static_cast<unsigned long long>(opts.run.spin_slack_ns),
-              static_cast<unsigned long long>(opts.run.lead_in_ns));
+              static_cast<unsigned long long>(opts.run.lead_in_ns),
+              opts.run.wait_for_ready ? " wait-for-ready" : "");
 
   // ---- The run. ----------------------------------------------------------
   const auto records = run(events, *dst, opts.run);
 
   print_stats(records, opts.quantiles);
   dst->report();
+
+  const auto [n_expected, n_mismatch] =
+      count_correction_mismatches(events, *dst);
+  if (n_expected > 0)
+    std::printf("corrections       expected=%zu mismatches=%zu (%.1f%%)\n",
+                n_expected, n_mismatch,
+                n_expected ? 100.0 * n_mismatch / n_expected : 0.0);
+
   if (!opts.csv_file.empty()) {
     write_csv(opts.csv_file, records);
     std::printf("per-event records written to %s\n", opts.csv_file.c_str());

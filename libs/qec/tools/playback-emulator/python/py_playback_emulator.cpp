@@ -16,7 +16,7 @@
 /// individually and every reason not to invite a Python-driven send loop.
 
 #include "playback_emulator.h"
-#include "session_sink.h"
+#include "sinks.h"
 
 #include <nanobind/nanobind.h>
 #include <nanobind/stl/string.h>
@@ -39,7 +39,7 @@ struct playback_result {
   std::size_t records_total = 0;
   std::uint64_t span_ns = 0;
 
-  /// Ascending-sorted, one entry per event.  
+  /// Ascending-sorted, one entry per event.
   std::vector<std::uint64_t> lateness;
   std::vector<std::uint64_t> latency;
 
@@ -49,6 +49,16 @@ struct playback_result {
   std::vector<std::uint8_t> corrections;
   std::size_t correction_width = 0;
   std::vector<std::string> warnings;
+
+  /// Correction-verification results (non-zero only when the playback file
+  /// carries expected bits on get_corrections records).
+  std::size_t reads_with_expected = 0;
+  std::size_t correction_mismatches = 0;
+
+  /// Per-call outcome counts for get_corrections.
+  std::uint64_t reads_ok = 0;
+  std::uint64_t reads_not_ready = 0;
+  std::uint64_t reads_error = 0;
 };
 
 // sentinel: spin_slack_ns == 0 means "calibrate automatically"
@@ -61,10 +71,13 @@ playback_result run_playback(const std::string &playback,
                             const std::string &server_host,
                             int server_port, int server_slots,
                             int server_slot_size, int server_observables,
-                            const std::string &dem_file) {
+                            const std::string &dem_file,
+                            bool wait_for_ready,
+                            const std::string &csv_file) {
   run_config cfg;
   cfg.lead_in_ns = lead_in_ns;
   cfg.pin_cpu = pin_cpu;
+  cfg.wait_for_ready = wait_for_ready;
 
   playback_result out;
 
@@ -88,8 +101,6 @@ playback_result run_playback(const std::string &playback,
   std::unique_ptr<sink> dst;
   if (sink_name == "null")
     dst = std::make_unique<null_sink>();
-  else if (sink_name == "inproc_rpc")
-    dst = make_inproc_rpc_sink(config, decoder_id, dem_file);
   else if (sink_name == "ring_buffer_injector")
     dst = make_ring_buffer_injector_sink(config, decoder_id, dem_file);
   else if (sink_name == "udp_server")
@@ -101,7 +112,7 @@ playback_result run_playback(const std::string &playback,
                                static_cast<std::uint64_t>(server_observables));
   else
     throw std::invalid_argument("run_playback: unknown sink '" + sink_name +
-                                "'; expected null, inproc_rpc, ring_buffer_injector or udp_server");
+                                "'; expected null, ring_buffer_injector or udp_server");
 
   const auto meta_it = file.meta.find(decoder_id);
   if (meta_it != file.meta.end() && meta_it->second.syndrome_size &&
@@ -127,6 +138,14 @@ playback_result run_playback(const std::string &playback,
   out.latency = latency_ns(records);
   out.corrections = dst->corrections();
   out.correction_width = dst->correction_width();
+  out.reads_ok = dst->reads_ok();
+  out.reads_not_ready = dst->reads_not_ready();
+  out.reads_error = dst->reads_error();
+  const auto [n_exp, n_mis] = count_correction_mismatches(events, *dst);
+  out.reads_with_expected = n_exp;
+  out.correction_mismatches = n_mis;
+  if (!csv_file.empty())
+    write_csv(csv_file, records);
   return out;
 }
 
@@ -162,7 +181,18 @@ NB_MODULE(qec_playback_emulator, m) {
       .def_ro("correction_width", &playback_result::correction_width,
               "Bits per read -- the decoder's observable count.")
       .def_ro("warnings", &playback_result::warnings,
-              "Real-time knobs that could not be applied.");
+              "Real-time knobs that could not be applied.")
+      .def_ro("reads_with_expected", &playback_result::reads_with_expected,
+              "get_corrections events that carried expected bits in the "
+              "playback file.")
+      .def_ro("correction_mismatches", &playback_result::correction_mismatches,
+              "Reads where actual corrections differed from expected.")
+      .def_ro("reads_ok", &playback_result::reads_ok,
+              "get_corrections calls that returned OK.")
+      .def_ro("reads_not_ready", &playback_result::reads_not_ready,
+              "get_corrections calls that returned NOT_READY.")
+      .def_ro("reads_error", &playback_result::reads_error,
+              "get_corrections calls that returned an error status.");
 
   m.def("run_playback", &run_playback, nb::arg("playback"),
         nb::arg("sink") = "null", nb::arg("config") = "",
@@ -173,18 +203,25 @@ NB_MODULE(qec_playback_emulator, m) {
         nb::arg("server_host") = "127.0.0.1", nb::arg("server_port") = 0,
         nb::arg("server_slots") = 8, nb::arg("server_slot_size") = 256,
         nb::arg("server_observables") = 1, nb::arg("dem_file") = "",
+        nb::arg("wait_for_ready") = false, nb::arg("csv") = "",
         R"doc(Play a playback file and return timing stats plus corrections.
 
-sink: "null" (jitter floor, no decoder), "inproc_rpc" (one ACK-waited RPC per
-record, ring depth 1), "ring_buffer_injector" (no ACK wait, full ring depth), or
-"udp_server" (frames shipped to a REMOTE decoding_server; needs server_port
-rather than config).  The two in-process sinks need `config`, a multi-decoder
-YAML.
+sink: "null" (jitter floor, no decoder), "ring_buffer_injector" (no ACK wait,
+full ring depth), or "udp_server" (frames shipped to a REMOTE decoding_server;
+needs server_port rather than config).  The in-process sink needs `config`, a
+multi-decoder YAML.
 
 spin_slack_ns: the tail of each inter-event gap the runner spins rather than
 sleeps, in nanoseconds.  0 (default) measures the machine's worst-case
 clock_nanosleep overshoot and sets slack = 2x that automatically.  Pass an
 explicit value to override.
+
+wait_for_ready: when True, get_corrections retries on NOT_READY until the
+decoder responds OK or times out.  Use to separate "decoder too slow" from
+"schedule too tight" without rewriting the playback file.
+
+csv: path to write per-event timing records (deadline_ns, lateness_ns, etc.).
+Empty string (default) disables CSV output.
 
 One source per process: rpc_producer enforces single-producer with a
 process-global flag, so do not call this concurrently from threads.)doc");

@@ -80,7 +80,7 @@ inline void spin_until_ns(std::uint64_t deadline) {
   // deadline.  A compiler fence emits no instruction and only stops the empty
   // loop being optimised away.
   //
-  // The flag-polling spins in session_sink.cpp are the opposite case and DO
+  // The flag-polling spins in ring_buffer_injector_sink.cpp DO
   // keep the hint -- see reclaim() there.
   while (now_ns() < deadline)
     std::atomic_signal_fence(std::memory_order_seq_cst);
@@ -250,8 +250,11 @@ playback_file load_playback(const std::string &path) {
         else if (token.rfind("syndrome_size=", 0) == 0)
           have_ss = parse_u64(token.substr(14), ss);
       }
-      if (have_did && have_ss)
-        file.meta[did].syndrome_size = ss;
+      if (have_did) {
+        file.meta[did]; // ensure entry exists
+        if (have_ss)
+          file.meta[did].syndrome_size = ss;
+      }
       continue;
     }
 
@@ -294,13 +297,23 @@ playback_file load_playback(const std::string &path) {
              "-bit wire cap");
     }
 
+    // get_corrections allows an optional expected-correction bit string so the
+    // emulator can verify the decoder's output in-line, without an out-of-band
+    // diff.  Any other trailing operand is still an error.
     std::string extra;
-    if (fields >> extra)
-      fail("unexpected trailing operand `" + extra + "` for " +
-           to_string(rec.op) +
-           "; get_corrections takes no operands (it always returns the "
-           "decoder's observable count and never resets -- follow it with an "
-           "explicit `reset` if you need one)");
+    if (fields >> extra) {
+      if (rec.op != operation::get_corrections)
+        fail("unexpected trailing operand `" + extra + "` for " +
+             to_string(rec.op));
+      rec.expected_offset = file.expected_bits.size();
+      for (const char c : extra) {
+        if (c != '0' && c != '1')
+          fail(std::string("expected correction bits must be `0`/`1`, got `") +
+               c + "` in: " + extra);
+        file.expected_bits.push_back(static_cast<std::uint8_t>(c - '0'));
+      }
+      rec.expected_count = extra.size();
+    }
 
     file.records.push_back(rec);
   }
@@ -350,13 +363,18 @@ std::vector<event> build_events(const playback_file &file,
 
     const std::uint8_t *data =
         takes_syndromes(rec.op) ? file.bits.data() + rec.bit_offset : nullptr;
+    const std::uint8_t *expected =
+        rec.expected_count > 0
+            ? file.expected_bits.data() + rec.expected_offset
+            : nullptr;
     // Ticks become nanoseconds HERE, once, alongside the prefix sum -- the run
     // loop never multiplies, and a late wake-up cannot accumulate.
     if (tick_ns != 0 && offset > UINT64_MAX / tick_ns)
       throw std::runtime_error(
           "build_events: tick " + std::to_string(offset) + " x " +
           std::to_string(tick_ns) + " ns overflows the schedule");
-    events.push_back({rec.op, data, rec.bit_count, offset * tick_ns});
+    events.push_back(
+        {rec.op, data, rec.bit_count, offset * tick_ns, expected, rec.expected_count});
   }
 
   if (events.empty())
@@ -399,7 +417,6 @@ std::vector<std::string> apply_rt_config(const run_config &cfg) {
                          ": " + std::strerror(errno));
   }
 
-  // Requires CAP_IPC_LOCK; fails harmlessly on unprivileged containers / large working sets.
   if (mlockall(MCL_CURRENT | MCL_FUTURE) != 0)
     warnings.push_back(std::string("mlockall failed: ") + std::strerror(errno));
 
@@ -427,6 +444,7 @@ std::vector<record> run(const std::vector<event> &events, sink &dst,
   // Allocated and fully written before t0 so no page in it faults mid-run.
   std::vector<record> records(events.size(), record{0, 0, 0});
 
+  dst.set_wait_for_ready(cfg.wait_for_ready);
   const std::uint64_t t0 = now_ns() + cfg.lead_in_ns;
   dst.warm_up();
   // Align precisely to t0. Without this, the first event's wait_until sleeps
@@ -532,6 +550,39 @@ void write_csv(const std::string &path, const std::vector<record> &records) {
         << r.return_ns << ',' << late << ',' << (r.return_ns - r.call_ns)
         << '\n';
   }
+}
+
+std::pair<std::size_t, std::size_t>
+count_correction_mismatches(const std::vector<event> &events, const sink &dst) {
+  const std::size_t width = dst.correction_width();
+  const auto &actual = dst.corrections();
+  std::size_t reads_with_expected = 0;
+  std::size_t mismatches = 0;
+  std::size_t read_index = 0;
+
+  for (const auto &e : events) {
+    if (e.op != operation::get_corrections) continue;
+    if (e.expected_data != nullptr) {
+      ++reads_with_expected;
+      // A width mismatch is itself a mismatch.
+      if (width == 0 || e.expected_count != width) {
+        ++mismatches;
+      } else {
+        const std::size_t base = read_index * width;
+        if (base + width > actual.size()) {
+          ++mismatches; // corrections not available for this read
+        } else {
+          for (std::size_t i = 0; i < width; ++i)
+            if ((actual[base + i] & 0x1u) != (e.expected_data[i] & 0x1u)) {
+              ++mismatches;
+              break;
+            }
+        }
+      }
+    }
+    ++read_index;
+  }
+  return {reads_with_expected, mismatches};
 }
 
 } // namespace cudaq::qec::emulator
