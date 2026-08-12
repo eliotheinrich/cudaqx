@@ -18,8 +18,8 @@
 // Internal headers: the producer entry point and the session that owns the
 // ring live in lib/, not include/.  The tool is in-tree, so reach them
 // directly rather than widening the public surface for a prototype.
-#include "cudaq/qec/realtime/qec_realtime_session.h"
-#include "cudaq/qec/realtime/rpc_producer.h"
+#include "qec_realtime_session.h"
+#include "rpc_producer.h"
 #include "../../lib/realtime/realtime_decoding.h"
 
 #include <algorithm>

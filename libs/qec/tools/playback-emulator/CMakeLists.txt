@@ -44,10 +44,9 @@ set(_PE_INCLUDE_DIRS
   ${CMAKE_CURRENT_SOURCE_DIR}
   ${CUDAQ_REALTIME_INCLUDE_DIR}
   ${CUDAToolkit_INCLUDE_DIRS}
-  # qec_realtime_session.h and rpc_producer.h are installed to
-  # ${CMAKE_INSTALL_PREFIX}/include but are not part of the public CMake
-  # INTERFACE_INCLUDE_DIRECTORIES.  Add the install tree directly.
-  ${CMAKE_INSTALL_PREFIX}/include
+  # qec_realtime_session.h and rpc_producer.h are private headers in lib/realtime/;
+  # reached directly because this tool is in-tree (see ring_buffer_injector_sink.cpp).
+  ${CMAKE_CURRENT_SOURCE_DIR}/../../lib/realtime
 )
 
 set(_PE_LINK_LIBS
