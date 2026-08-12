@@ -37,6 +37,7 @@ set(_PE_SOURCES
   ${CMAKE_CURRENT_SOURCE_DIR}/playback_emulator.cpp
   ${CMAKE_CURRENT_SOURCE_DIR}/ring_buffer_injector_sink.cpp
   ${CMAKE_CURRENT_SOURCE_DIR}/udp_server_sink.cpp
+  ${CMAKE_CURRENT_SOURCE_DIR}/udp_ring_sink.cpp
 )
 
 set(_PE_INCLUDE_DIRS
@@ -86,27 +87,31 @@ install(TARGETS qec_playback_emulator
 )
 
 # ── Python module ─────────────────────────────────────────────────────────────
-# The CLI binary always builds.  The Python module builds when nanobind is
-# available -- either because the python subdirectory was already processed
-# (full in-tree build) or because nanobind is pip-installed and discoverable
-# via its own CMake dir.
-
+# The CLI binary always builds.  The Python module needs nanobind.
+#
+# If the qec python subdirectory has already brought it into scope, reuse that.
+# Otherwise fetch the SAME pinned version it uses -- never a pip-installed one.
+# nanobind keys its internals capsule by ABI tag, so a module built against a
+# different nanobind gets its own internals and cannot see the types CUDA-Q
+# registered; `cudaq::kraus_channel` then goes missing and every module in the
+# build aborts at import.  Pinning here rather than relying on subdirectory
+# order is what lets this build regardless of where it is added from.
 if(NOT COMMAND nanobind_add_module)
-  find_package(Python COMPONENTS Interpreter Development.Module QUIET)
+  find_package(Python QUIET COMPONENTS Interpreter Development.Module)
   if(Python_FOUND)
-    execute_process(
-      COMMAND ${Python_EXECUTABLE} -c "import nanobind; print(nanobind.cmake_dir())"
-      OUTPUT_VARIABLE _NB_CMAKE_DIR OUTPUT_STRIP_TRAILING_WHITESPACE ERROR_QUIET
-      RESULT_VARIABLE _NB_RESULT)
-    if(_NB_RESULT EQUAL 0 AND _NB_CMAKE_DIR)
-      list(APPEND CMAKE_PREFIX_PATH "${_NB_CMAKE_DIR}")
-      find_package(nanobind CONFIG QUIET)
-    endif()
+    include(FetchContent)
+    FetchContent_Declare(
+      nanobind
+      GIT_REPOSITORY https://github.com/wjakob/nanobind
+      GIT_TAG v2.12.0            # must match libs/qec/python/CMakeLists.txt
+      EXCLUDE_FROM_ALL
+    )
+    FetchContent_MakeAvailable(nanobind)
   endif()
 endif()
 
 if(COMMAND nanobind_add_module)
-  nanobind_add_module(qec_playback_emulator_py
+  nanobind_add_module(qec_playback_emulator_py NB_DOMAIN cudaq
     ${CMAKE_CURRENT_SOURCE_DIR}/python/py_playback_emulator.cpp
     ${_PE_SOURCES}
   )

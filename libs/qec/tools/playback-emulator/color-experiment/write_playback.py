@@ -6,128 +6,118 @@
 # the terms of the Apache License 2.0 which accompanies this distribution.     #
 # ============================================================================ #
 
-# Sample a d=5 superdense color-code memory circuit and write the three files
-# run_playback.py needs: playback.txt, decoder.yaml, dem.txt, and truth.npy.
+# Write the artifacts run_server.py replays: a color-code memory experiment
+# staged as an Ising predecoder in front of Chromobius.
 #
-# Env: ISING_DECODING — clone of NVIDIA/Ising-Decoding
+#   playback.txt      timed reset / enqueue / get_corrections records
+#   trt_decoder.yaml  trt_decoder(onnx) with global_decoder=chromobius
+#   dem.txt           Stim DEM -- Chromobius is DEM-native and cannot use H
+#   predecoder.onnx   exported from the released HuggingFace safetensors
+#   truth.npy         observable flips, for scoring
+#
+# Two things that fail SILENTLY if changed:
+#   * gidney_style_noise=True -- the checkpoint is trained on that noise
+#     structure; a hand-built MemoryCircuit still "works" but costs most of the
+#     predecoder's benefit.
+#   * the ONNX is re-exported every run.  A stale one decodes at chance.
+#
+# Env: ISING_DECODING (repo clone), ISING_MODEL (safetensors checkpoint)
 
-import os
-import sys
+import os, sys, warnings
+from types import SimpleNamespace
 
-sys.path.insert(
-    0,
-    os.path.join(os.environ.get("ISING_DECODING", "/workspaces/ising-decoding"),
-                 "code")
-)
-from qec.color_code.memory_circuit import MemoryCircuit
+ISING = os.environ.get("ISING_DECODING", "/workspaces/Ising-Decoding")
+HERE = os.path.dirname(os.path.abspath(__file__))
+sys.path[:0] = [os.path.join(ISING, "code"), os.path.join(HERE, "..")]
 
-sys.path.insert(
-    0, 
-    os.path.join(os.path.dirname(os.path.abspath(__file__)), "..")
-)
+import numpy as np, torch, cudaq_qec as qec
+from qec.color_code.color_code import ColorCode
+from qec.color_code.detector_input import ColorDetectorInputTransform
+from qec.color_code.reference_superdense_noise import build_color_memory_circuit
+from benchmarks.export_detector_input_trtexec import DetectorInputColorEval, DetectorInputModel
+from evaluation.logical_error_rate_color import PreDecoderColorEvalModule, _build_color_code_parity_maps
+from export.safetensors_utils import load_safetensors
 from playback_from_circuit import write_playback_from_circuit
 
+D, ROUNDS, P, SHOTS, SEED = 13, 13, 4e-3, 200, 42
+WEIGHTS = os.environ.get("ISING_MODEL", "/workspaces/models/"
+                         "ising_decoder_color_code_1_fast_r13_v1.0.400_fp16.safetensors")
+MEAS = {"M", "MZ", "MX", "MY", "MR", "MRX", "MRY", "MRZ"}
+out = lambda n: os.path.join(HERE, n)
 
-import numpy as np
-import cudaq_qec as qec
+# The circuit the checkpoint was trained on.
+circuit = build_color_memory_circuit(
+    distance=D, n_rounds=ROUNDS, basis="Z", p_error=P, noise_model_family="legacy",
+    noise_instruction_semantics="current", gidney_style_noise=True,
+    schedule="nearest-neighbor", add_boundary_detectors=True).stim_circuit
 
-HERE = os.path.dirname(os.path.abspath(__file__))
-
-DISTANCE   = 5
-ROUNDS     = 5
-ERROR_RATE = 3e-3
-SHOTS      = 200
-SEED       = 42
-
-
-# From Ising-Decoding
-memory = MemoryCircuit(distance=DISTANCE, n_rounds=ROUNDS, basis="Z",
-                       add_boundary_detectors=True,
-                       idle_error=ERROR_RATE, sqgate_error=ERROR_RATE,
-                       tqgate_error=ERROR_RATE, spam_error=ERROR_RATE)
-circuit = memory.stim_circuit
-
-# H and O come from the Stim DEM via cudaq_qec.
 dem_text = str(circuit.detector_error_model(decompose_errors=False))
 dem = qec.dem_from_stim_text(dem_text)
-H = np.array(dem.detector_error_matrix,    dtype=np.uint8)
-O = np.array(dem.observables_flips_matrix, dtype=np.uint8)
+H = np.array(dem.detector_error_matrix, np.uint8)
+O = np.array(dem.observables_flips_matrix, np.uint8)
 
-# m2d (measurement → detector map) is extracted manually from the circuit's
-# DETECTOR instructions.  It cannot be obtained automatically until the
-# color-code memory circuit is available as a CUDA-Q kernel, at which point
-# qec.decoder_context_from_memory_circuit() would provide it directly.
-m2d = []
-n = 0
-MEASURE_OPS = {"M", "MZ", "MX", "MY", "MR", "MRX", "MRY", "MRZ"}
-for inst in circuit.flattened():
-    if inst.name in MEASURE_OPS:
-        n += len(inst.targets_copy())
-    elif inst.name == "DETECTOR":
-        m2d.append(sorted(n + t.value for t in inst.targets_copy()))
+# m2d maps measurement -> detector: the wire carries raw MEASUREMENTS and the
+# decoder applies D itself.  obs_support is the observable's data-qubit support
+# (the Ising benchmark exporter's `[::2]` placeholder yields a useless pre_L).
+data_start = int(circuit.num_measurements) - ColorCode(D).num_data
+m2d, support, seen = [], [], 0
+for name, targets, _ in circuit.flattened_operations():
+    if name in MEAS:
+        seen += sum(isinstance(t, int) for t in targets)
+    elif name == "DETECTOR":
+        m2d.append(sorted(seen + int(t[1]) for t in targets if t[0] == "rec"))
+    elif name == "OBSERVABLE_INCLUDE":
+        support += [seen + int(t[1]) - data_start for t in targets
+                    if t[0] == "rec" and seen + int(t[1]) >= data_start]
 
-# Ground truth: the last column of the detector sample (the observable flip).
-# Both the detector sampler and the measurement sampler used in
-# write_playback_from_circuit draw from the same noise realisations when
-# given the same seed, so the observable column is consistent with the
-# measurement records written to playback.txt.
-dets_and_obs = circuit.compile_detector_sampler(seed=SEED).sample(
-    SHOTS, append_observables=True).astype(np.uint8)
-truth = dets_and_obs[:, -1]
+# predecoder.onnx: dets[N] -> [pre_L, residual_dets][1+N]
+model = load_safetensors(WEIGHTS, device="cpu")[0].float().eval()  # release is fp16
+xform = ColorDetectorInputTransform(distance=D, rounds=ROUNDS, basis="Z")
+maps = _build_color_code_parity_maps(D)
+obs_support = torch.zeros(int(maps["num_data"]))
+obs_support[support] = 1.0
+cfg = SimpleNamespace(code="color", distance=D, n_rounds=ROUNDS, enable_fp16=False,
+    model=SimpleNamespace(version="predecoder_memory_v1", dropout_p=0.01, activation="gelu",
+                          num_filters=[256] * 5 + [4], kernel_size=[3] * 6,
+                          input_channels=4, out_channels=4),
+    test=SimpleNamespace(th_data=0.0, th_syn=0.0, sampling_mode="threshold",
+                         temperature=1.0, temperature_data=1.0, temperature_syn=1.0))
+pipeline = DetectorInputColorEval(
+    DetectorInputModel(xform, model),
+    PreDecoderColorEvalModule(model, cfg, maps, basis="Z", obs_support=obs_support,
+                              num_boundary_dets=int(xform.num_stabs),
+                              enable_delta_s2_correction=False, enable_z_ff=True)).eval()
+# dynamo=False on purpose: the torch.export path bakes the batch dim into a
+# Concat and silently yields a model that fails for batch > 1.  The tracer then
+# warns that `if T > 1` is frozen, which is what we want -- the ONNX is per-(d,T).
+with warnings.catch_warnings():
+    warnings.simplefilter("ignore", DeprecationWarning)
+    warnings.simplefilter("ignore", torch.jit.TracerWarning)
+    torch.onnx.export(pipeline, torch.zeros(1, xform.detector_width), out("predecoder.onnx"),
+                      opset_version=17, input_names=["dets"], output_names=["L_and_residual_dets"],
+                      dynamic_axes={"dets": {0: "batch"}, "L_and_residual_dets": {0: "batch"}},
+                      do_constant_folding=True, dynamo=False)
 
-
-# ── Playback Emulator ─────────────────────────────────────────────────────────
-#
-# Three files drive the emulator:
-#
-#   playback.txt   timed stream of reset / enqueue / get_corrections records
-#   decoder.yaml   H / O / D matrices + decoder type (chromobius)
-#   dem.txt        Stim DEM; Chromobius needs this instead of H for color codes
-
-# playback.txt — paced by the circuit's own TICK structure.
-# Provided by playback_from_circuit.py
-write_playback_from_circuit(
-    circuit, os.path.join(HERE, "playback.txt"), shots=SHOTS, seed=SEED)
-
-# decoder.yaml — built with the cudaq_qec config API
+# trt_decoder splits its output as [pre_L, residual]; the width must equal
+# num_observables + global_decoder.syndrome_size.  stim_dem_path is what lets
+# Chromobius -- which needs a DEM string, not H -- be the global decoder.
 dc = qec.decoder_config()
-dc.id            = 0
-dc.type          = "chromobius"
-dc.block_size    = H.shape[1]
-dc.syndrome_size = H.shape[0]
-dc.H_sparse      = qec.pcm_to_sparse_vec(H)
-dc.O_sparse      = qec.pcm_to_sparse_vec(O)
-dc.D_sparse      = qec.d_sparse(m2d)
-
+dc.id, dc.type = 0, "trt_decoder"
+dc.block_size, dc.syndrome_size = H.shape[1], H.shape[0]
+dc.H_sparse, dc.O_sparse = qec.pcm_to_sparse_vec(H), qec.pcm_to_sparse_vec(O)
+dc.D_sparse, dc.stim_dem_path = qec.d_sparse(m2d), out("dem.txt")
+dc.decoder_custom_args = {"onnx_load_path": out("predecoder.onnx"), "batch_size": 1,
+                          "use_cuda_graph": True, "global_decoder": "chromobius",
+                          "global_decoder_params": {}}
 mdc = qec.multi_decoder_config()
 mdc.decoders = [dc]
-with open(os.path.join(HERE, "decoder.yaml"), "w") as f:
-    f.write(mdc.to_yaml_str())
+open(out("trt_decoder.yaml"), "w").write(mdc.to_yaml_str())
+open(out("dem.txt"), "w").write(dem_text)
 
-# dem.txt — per-detector color/basis coordinates.
-with open(os.path.join(HERE, "dem.txt"), "w") as f:
-    f.write(dem_text)
+write_playback_from_circuit(circuit, out("playback.txt"), shots=SHOTS, seed=SEED)
+np.save(out("truth.npy"), circuit.compile_detector_sampler(seed=SEED).sample(
+    SHOTS, append_observables=True).astype(np.uint8)[:, -1])
 
-# server_decoder.yaml — same matrices, but multi_error_lut instead of chromobius.
-# Chromobius requires a DEM string that cannot be delivered via the server YAML,
-# so the decoding-server demo uses a matrix-based decoder instead.
-dc_srv = qec.decoder_config()
-dc_srv.id            = 0
-dc_srv.type          = "multi_error_lut"
-dc_srv.block_size    = H.shape[1]
-dc_srv.syndrome_size = H.shape[0]
-dc_srv.H_sparse      = qec.pcm_to_sparse_vec(H)
-dc_srv.O_sparse      = qec.pcm_to_sparse_vec(O)
-dc_srv.D_sparse      = qec.d_sparse(m2d)
-dc_srv.decoder_custom_args = {"lut_error_depth": 2}
-mdc_srv = qec.multi_decoder_config()
-mdc_srv.decoders = [dc_srv]
-with open(os.path.join(HERE, "server_decoder.yaml"), "w") as f:
-    f.write(mdc_srv.to_yaml_str())
-
-# truth.npy — ground-truth observable flips for scoring in run_playback.py.
-np.save(os.path.join(HERE, "truth.npy"), truth)
-
-print("d=%d r=%d p=%g  %d shots" % (DISTANCE, ROUNDS, ERROR_RATE, SHOTS))
-print("  H=%dx%d  wrote decoder.yaml  server_decoder.yaml  dem.txt  "
-      "playback.txt  truth.npy" % H.shape)
+print("d=%d rounds=%d p=%g %d shots | %d detectors -> onnx width %d | wrote "
+      "playback.txt trt_decoder.yaml dem.txt predecoder.onnx truth.npy"
+      % (D, ROUNDS, P, SHOTS, H.shape[0], 1 + xform.detector_width))

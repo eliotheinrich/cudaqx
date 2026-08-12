@@ -47,7 +47,8 @@ then reports how accurately it hit that schedule.
             │  sink (chosen at startup)
             ├─ null_sink            discard; pure timing floor
             ├─ ring_buffer_injector write directly into ring → in-process
-            └─ udp_server_sink      UDP transport → decoding_server
+            ├─ udp_server_sink      UDP datagrams → decoding_server
+            └─ udp_ring_sink        retired reference (RoCE-shaped ring)
 ```
 
 **Timing thread discipline.**  Everything that could allocate, block, or page-fault
@@ -150,7 +151,7 @@ qec_playback_emulator --playback=my.txt --tick=1us \
 |------|---------|-------------|
 | `--playback=<file>` | *(required)* | Playback file to replay. |
 | `--tick=<dur>` | *(required)* | Wall-clock duration of one tick (e.g. `1us`, `500ns`, `2.5ms`). |
-| `--sink=<name>` | `null` | `null` — timing only; `ring_buffer_injector` — in-process, full ring depth; `udp_server` — send events to a remote `decoding_server`. |
+| `--sink=<name>` | `null` | `null` — timing only; `ring_buffer_injector` — in-process, full ring depth; `udp_server` — send events to a remote `decoding_server`; `udp_ring` — retired reference, the same over the RoCE-shaped ring API. |
 | `--config=<file>` | | Decoder YAML config (required for `ring_buffer_injector`). |
 | `--dem=<file>` | | DEM file for chromobius (alternative to `--config`). |
 | `--decoder-id=N` | `0` | Which decoder entry in `--config` to load; also selects records from the playback file. |
@@ -160,11 +161,11 @@ qec_playback_emulator --playback=my.txt --tick=1us \
 | `--cpu=N` | | Pin the timing thread to CPU N. |
 | `--csv=<file>` | | Write per-event timing records to a CSV file. |
 | `--percentiles=A,B,...` | `50,90,99,99.9,100` | Lateness percentiles to print at the end of the run. |
-| `--server-host=H` | `127.0.0.1` | `udp_server`: decoding_server hostname. |
-| `--server-port=N` | *(required for udp_server)* | `udp_server`: port from the server's `QEC_DECODING_SERVER_READY` line. |
-| `--server-slots=N` | `8` | `udp_server`: number of ring-buffer slots (must match `decoding_server --num-slots`). **If you see "timed out awaiting … response in slot N" on a jittery host (WSL2, VM, shared cloud node), increase this first** — try doubling it (`--server-slots=16` + `decoding_server --num-slots=16`). Stalls that let the client outpace the server by more than one ring lap exhaust the ring before a response can arrive. |
-| `--server-slot-size=N` | `256` | `udp_server`: bytes per slot. |
-| `--server-observables=N` | `1` | `udp_server`: number of logical observable bits returned per `get_corrections`. |
+| `--server-host=H` | `127.0.0.1` | `udp_server`/`udp_ring`: decoding_server hostname. |
+| `--server-port=N` | *(required for udp_server/udp_ring)* | port from the server's `QEC_DECODING_SERVER_READY` line. |
+| `--server-slots=N` | `8` | `udp_ring` **only** — number of ring slots, matching `decoding_server --num-slots`. `udp_server` keeps no client-side ring, so it ignores this: replies are matched by `request_id` and the kernel's socket queue holds them. |
+| `--server-slot-size=N` | `256` | `udp_server`/`udp_ring`: bytes per datagram; must match the server's stride. |
+| `--server-observables=N` | `1` | `udp_server`/`udp_ring`: logical observable bits returned per `get_corrections`. |
 
 ## Python API
 

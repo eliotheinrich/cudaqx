@@ -105,12 +105,18 @@ playback_result run_playback(const std::string &playback,
     dst = make_udp_server_sink(server_host,
                                static_cast<std::uint16_t>(server_port),
                                decoder_id,
-                               static_cast<std::uint32_t>(server_slots),
                                static_cast<std::uint32_t>(server_slot_size),
                                static_cast<std::uint64_t>(server_observables));
+  else if (sink_name == "udp_ring")
+    dst = make_udp_ring_sink(server_host,
+                             static_cast<std::uint16_t>(server_port),
+                             decoder_id,
+                             static_cast<std::uint32_t>(server_slots),
+                             static_cast<std::uint32_t>(server_slot_size),
+                             static_cast<std::uint64_t>(server_observables));
   else
     throw std::invalid_argument("run_playback: unknown sink '" + sink_name +
-                                "'; expected null, ring_buffer_injector or udp_server");
+                                "'; expected null, ring_buffer_injector, udp_server or udp_ring");
 
   const auto meta_it = file.meta.find(decoder_id);
   if (meta_it != file.meta.end() && meta_it->second.syndrome_size &&
@@ -203,7 +209,10 @@ NB_MODULE(qec_playback_emulator, m) {
         R"doc(Play a playback file and return timing stats plus corrections.
 
 sink: "null" (jitter floor, no decoder), "ring_buffer_injector" (no ACK wait,
-full ring depth), or "udp_server" (frames shipped to a REMOTE decoding_server;
+full ring depth), "udp_server" (frames shipped to a REMOTE decoding_server;
+the default for remote work: a plain socket, replies matched by request_id,
+so server_slots does not apply), or "udp_ring" (retired reference doing the
+same over the RoCE-shaped ring API, and the only sink server_slots affects;
 needs server_port rather than config).  The in-process sink needs `config`, a
 multi-decoder YAML.
 

@@ -20,6 +20,7 @@
 // directly rather than widening the public surface for a prototype.
 #include "cudaq/qec/realtime/qec_realtime_session.h"
 #include "cudaq/qec/realtime/rpc_producer.h"
+#include "../../lib/realtime/realtime_decoding.h"
 
 #include <algorithm>
 #include <chrono>
@@ -87,9 +88,23 @@ public:
     // Mirrors realtime_decoding.cpp::create_realtime_decoder: build the parity
     // check matrix from the sparse config, realize the plugin, and attach the
     // observable / detector maps the decode path expects.
-    auto params = match->decoder_custom_args_to_heterogeneous_map();
+    // Use the library's own parameter preparation rather than re-deriving it:
+    // it materializes `O` for trt_decoder, synthesizes an empty
+    // `global_decoder_params` when one is missing, and -- the part that matters
+    // here -- reads `stim_dem_path` and forwards the model text down as
+    // `global_decoder_params.stim_dem` so a DEM-native GLOBAL decoder
+    // (chromobius behind a TRT predecoder) can be constructed.  Duplicating
+    // that logic is how this sink previously silently dropped the DEM.
+    auto params =
+        cudaq::qec::decoding::host::prepare_decoder_params(*match);
     if (match->cuda_device_id.has_value())
       params.insert("cuda_device_id", match->cuda_device_id.value());
+
+    // A top-level DEM decoder can be named by the config instead of --dem.
+    std::string dem_source = dem_file;
+    if (dem_source.empty() && !match->stim_dem_path.empty() &&
+        !params.contains("global_decoder"))
+      dem_source = match->stim_dem_path;
 
     // `decoder_init` is a variant, but realtime_decoding.cpp only ever fills
     // the matrix alternative -- which locks out decoders that need a Stim DEM
@@ -101,11 +116,11 @@ public:
     // is independent of how accumulated measurements become detectors.
     cudaq::qec::decoder_init init = cudaq::qec::pcm_from_sparse_vec(
         match->H_sparse, match->syndrome_size, match->block_size);
-    if (!dem_file.empty()) {
-      std::ifstream dem_in(dem_file);
+    if (!dem_source.empty()) {
+      std::ifstream dem_in(dem_source);
       if (!dem_in)
         throw std::runtime_error(
-            "ring_buffer_injector_sink: cannot open dem_file " + dem_file);
+            "ring_buffer_injector_sink: cannot open dem_file " + dem_source);
       std::stringstream dem_buf;
       dem_buf << dem_in.rdbuf();
       init = dem_buf.str();
@@ -122,7 +137,7 @@ public:
     // num_observables and its H is detectors x observables.  The config's O
     // lives in error-mechanism space, so setting it would index far past that
     // matrix.  Leave the decoder's own mapping alone.
-    if (dem_file.empty())
+    if (dem_source.empty())
       decoder->set_O_sparse(match->O_sparse);
     // D is ours either way -- it maps the measurements we enqueue onto
     // detectors, which is a property of the playback, not of the decoder.
