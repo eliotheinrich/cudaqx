@@ -52,19 +52,8 @@ struct playback_result {
   std::size_t reads_with_expected = 0;
   std::size_t correction_mismatches = 0;
   std::uint64_t not_ready_retries = 0;
+  std::uint64_t syndromes_streamed = 0;
 };
-
-/// Convert a Python next_round() return value (bytes or list of ints) to a
-/// byte vector.
-static std::vector<std::uint8_t> obj_to_bytes(nb::object obj) {
-  if (nb::isinstance<nb::bytes>(obj)) {
-    auto b = nb::cast<nb::bytes>(obj);
-    return std::vector<std::uint8_t>(
-        reinterpret_cast<const std::uint8_t *>(b.c_str()),
-        reinterpret_cast<const std::uint8_t *>(b.c_str()) + b.size());
-  }
-  return nb::cast<std::vector<std::uint8_t>>(obj);
-}
 
 static std::unique_ptr<sink>
 make_sink(const std::string &sink_name, std::uint64_t decoder_id,
@@ -105,11 +94,14 @@ collect_result(const std::vector<record> &records,
   out.correction_width = dst.correction_width();
   for (const auto &r : records) {
     out.not_ready_retries += r.not_ready_retries;
+    out.syndromes_streamed += r.syndromes_streamed;
     if (r.correction_mismatch)
       ++out.correction_mismatches;
   }
   for (const auto &e : events)
-    if (e.op == operation::get_corrections && e.corrections_data != nullptr)
+    if ((e.op == operation::get_corrections ||
+         e.op == operation::stream_until) &&
+        e.corrections_data != nullptr)
       ++out.reads_with_expected;
   if (!csv_file.empty())
     write_csv(csv_file, records, events, dst.corrections(),
@@ -117,15 +109,12 @@ collect_result(const std::vector<record> &records,
   return std::move(out);
 }
 
-/// Load a playback file, optionally resolve syndrome sources, run, report.
+/// Load a playback file, resolve its syndrome sources, run, report.
 ///
-/// `sources` maps source IDs (integers from `source_id=N` playback lines) to
-/// SyndromeSource objects.  For source-backed enqueue events the source's
-/// next_round() is called while the GIL is held to pre-generate syndrome data;
-/// the GIL is released for the C++ timing run.
-///
-/// Both C++ SyndromeSource subclasses and duck-typed Python objects (with
-/// next_round()/syndrome_size()) are accepted as source values.
+/// `sources` maps the integers used in `source_id=N` playback lines to
+/// SyndromeSource instances.  `enqueue` events draw their single round here,
+/// while the GIL is held, so the timing loop sees only static bytes;
+/// `stream_until` keeps its source and pulls rounds inside run().
 playback_result run_playback(const std::string &playback,
                              nb::dict sources,
                              const std::string &sink_name,
@@ -146,18 +135,9 @@ playback_result run_playback(const std::string &playback,
 
   playback_result out;
 
-  // Split the Python sources dict into:
-  //   cpp_sources: C++ syndrome_source* for build_events to resolve upfront
-  //   py_sources:  duck-typed Python objects, resolved by ID after build_events
-  source_registry cpp_registry;
-  std::map<std::int64_t, nb::object> py_sources;
-  for (auto [key_obj, val_obj] : sources) {
-    const std::int64_t sid = nb::cast<std::int64_t>(key_obj);
-    if (nb::isinstance<syndrome_source>(val_obj))
-      cpp_registry[sid] = &nb::cast<syndrome_source &>(val_obj);
-    else
-      py_sources[sid] = nb::borrow<nb::object>(val_obj);
-  }
+  source_registry registry;
+  for (auto [key, value] : sources)
+    registry[nb::cast<std::int64_t>(key)] = &nb::cast<syndrome_source &>(value);
 
   const playback_file file = load_playback(playback);
   std::uint64_t tick_ns = 0;
@@ -165,37 +145,24 @@ playback_result run_playback(const std::string &playback,
     throw std::invalid_argument("run_playback: bad tick='" + tick + "'");
 
   auto events = build_events(file, decoder_id, tick_ns, deltas,
-                             &out.records_skipped, cpp_registry);
+                             &out.records_skipped, registry);
   out.records_total = file.records.size();
   out.span_ns = events.empty() ? 0 : events.back().offset_ns;
 
-  // Pre-generate syndrome data for all source-backed enqueue events while the
-  // GIL is still held.  After this pass every event has static syndrome_data,
-  // so the timing loop never calls back into Python or the trampoline.
-  //
-  // Uses a vector-of-vectors so that each inner vector's heap data pointer
-  // stays valid even if the outer vector reallocates.
-  std::vector<std::vector<std::uint8_t>> source_arena;
-  source_arena.reserve(events.size());
+  // Draw each source-backed `enqueue`'s single round now, while the GIL is
+  // held, so the timing loop never calls a (possibly Python) source.  Rounds
+  // live in a vector-of-vectors: each inner buffer keeps its address even if
+  // the outer vector reallocates.  `stream_until` keeps its source pointer --
+  // its round count is not known until the decoder answers.
+  std::vector<std::vector<std::uint8_t>> arena;
+  arena.reserve(events.size());
   for (auto &e : events) {
-    if (e.op != operation::enqueue) continue;
-    if (e.source != nullptr) {
-      // C++ syndrome_source (registered via cpp_registry).
-      source_arena.push_back(e.source->next_round());
-    } else if (e.source_id >= 0) {
-      // Duck-typed Python source not in cpp_registry.
-      const auto it = py_sources.find(e.source_id);
-      if (it == py_sources.end())
-        throw std::runtime_error(
-            "run_playback: no source registered for source_id=" +
-            std::to_string(e.source_id));
-      source_arena.push_back(obj_to_bytes(it->second.attr("next_round")()));
-    } else {
-      continue; // inline bits already in arena -- nothing to do
-    }
-    e.syndrome_data = source_arena.back().data();
-    e.num_syndromes = source_arena.back().size();
-    e.source = nullptr; // mark resolved so run() uses the static path
+    if (e.op != operation::enqueue || e.source == nullptr)
+      continue;
+    arena.push_back(e.source->next_round());
+    e.syndrome_data = arena.back().data();
+    e.num_syndromes = arena.back().size();
+    e.source = nullptr; // resolved: run() takes the static path
   }
 
   out.warnings = apply_rt_config(cfg);
@@ -269,7 +236,9 @@ NB_MODULE(qec_playback_emulator, m) {
       .def_ro("warnings", &playback_result::warnings)
       .def_ro("reads_with_expected", &playback_result::reads_with_expected)
       .def_ro("correction_mismatches", &playback_result::correction_mismatches)
-      .def_ro("not_ready_retries", &playback_result::not_ready_retries);
+      .def_ro("not_ready_retries", &playback_result::not_ready_retries)
+      .def_ro("syndromes_streamed", &playback_result::syndromes_streamed,
+              "Total syndrome rounds fed by stream_until events.");
 
   // --- Syndrome sources ---
 
@@ -356,14 +325,14 @@ Args:
         nb::arg("wait_for_ready") = false, nb::arg("csv") = "",
         R"doc(Load a playback file and replay it into the decoder.
 
-playback: path to a playback file.  Enqueue lines carry either inline syndrome
-          bits or `source_id=N` to pull syndrome data from a registered source.
+playback: path to a playback file.  `enqueue` lines carry either inline
+          syndrome bits or `source_id=N`; `stream_until` always takes
+          `source_id=N` and pulls rounds until the decoder is ready, absorbing
+          the correction read.
 
-sources: dict mapping source IDs (int) to SyndromeSource objects.  C++
-         SyndromeSource subclasses (including the stim sources defined here)
-         and plain Python objects implementing the protocol (next_round,
-         syndrome_size) are both accepted.  Syndrome data is pre-generated from
-         the source before the timing loop starts.
+sources: dict mapping the integers used in `source_id=N` to SyndromeSource
+         instances (StaticSyndromeSource, StimCircuitSource, StimMemorySource,
+         or your own Python subclass).  An unregistered id is an error.
 
 sink: "null", "ring_buffer_injector", "udp_server", or "udp_ring".
 tick: tick duration, e.g. "100us".  Must match the tick column in the file.

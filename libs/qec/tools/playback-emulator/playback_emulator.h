@@ -30,6 +30,7 @@
 
 #include <cstdint>
 #include <map>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
@@ -123,6 +124,25 @@ struct run_config {
 //   reset
 //       Clear the decoder's queued syndromes and zero its corrections.
 //
+//   stream_until source_id=N [expected_bits]
+//       Feed syndrome rounds from a registered syndrome_source into the decoder
+//       one at a time, polling try_get_corrections() after each, until the
+//       decoder signals ready or the source returns an empty vector (EOF).
+//       Uses the same source_id=N registration as enqueue; the source is
+//       called repeatedly via next_round() for as long as needed.
+//
+//       stream_until ABSORBS the read: the poll that succeeds is a consuming
+//       get_corrections, so the correction bits land in `sink::corrections()`
+//       exactly as an explicit `get_corrections` record would produce them.
+//       Do NOT follow a stream_until with a get_corrections -- the result has
+//       already been taken, and the second read would block for a decode that
+//       was never started.
+//
+//       `expected_bits` is optional and behaves exactly as on get_corrections.
+//       Example:
+//           0  stream_until  0  source_id=2
+//           0  stream_until  0  source_id=2  10   # expected: obs0=1 obs1=0
+//
 // Blank lines are ignored and `#` starts a comment that runs to end of line.
 //
 // Example:
@@ -137,8 +157,18 @@ struct run_config {
 //
 //===----------------------------------------------------------------------===//
 
-/// Operations a record can carry, one-to-one with the three decoding RPCs.
-enum class operation { enqueue, get_corrections, reset };
+/// Operations a record can carry.
+enum class operation {
+  enqueue,
+  get_corrections,
+  reset,
+  /// Drive the decoder from a registered syndrome_source, polling after each
+  /// round until the decoder signals ready or the source is exhausted.  The
+  /// successful poll is a consuming read, so this op also RETURNS corrections
+  /// (see `returns_corrections`).  Requires a sink implementing
+  /// try_get_corrections().
+  stream_until,
+};
 
 const char *to_string(operation op);
 bool parse_operation(const std::string &text, operation &out);
@@ -147,6 +177,8 @@ bool parse_operation(const std::string &text, operation &out);
 bool takes_syndromes(operation op);
 
 /// True when `op` reads a result back, and so must wait for its response.
+/// Both `get_corrections` and `stream_until` do: the latter absorbs the read
+/// into the poll that ends its streaming loop.
 bool returns_corrections(operation op);
 
 /// One parsed record.  The syndrome bits (and any expected correction bits)
@@ -203,15 +235,11 @@ struct event {
   /// Syndrome bit count (same as the byte length of `syndrome_data` due to
   /// the one-bit-per-byte layout).  0 for source-backed events until resolved.
   std::uint64_t num_syndromes;
-  /// Non-null for dynamically sourced enqueue events.  `run()` calls
-  /// `source->next_round()` just before firing and uses the returned bytes.
-  /// Null for all static (playback-file-backed) events.
+  /// Resolved from `source_id=N` by `build_events`.  Non-null exactly when the
+  /// record named a source: `enqueue` takes one `next_round()` from it,
+  /// `stream_until` takes rounds until the decoder is ready.  Null for
+  /// inline-bit events.
   syndrome_source *source = nullptr;
-  /// Source ID carried from `playback_record::source_id`.  -1 for inline-bit
-  /// events and for events built by `build_streaming_events`.  Non-negative
-  /// values allow the Python binding to pre-generate data from unregistered
-  /// (duck-typed) sources after `build_events` returns.
-  std::int64_t source_id = -1;
   std::uint64_t offset_ns;
   /// Optional expected correction bits, populated from `playback_record::
   /// corrections_offset/corrections_count`.  Null (and corrections_count == 0)
@@ -251,36 +279,17 @@ playback_file load_playback(const std::string &path);
 ///                    filtering would make a mistyped `--decoder-id` look like
 ///                    an empty file.
 ///
-/// Throws if absolute timestamps go backwards, or if no record matches.
-/// @param sources  Optional registry mapping source IDs to syndrome_source
-///                 pointers.  When an enqueue record carries `source_id=N`,
-///                 the matching source pointer is stored in `event::source`.
-///                 Pointers must outlive the returned events.
+/// @param sources     Maps `source_id=N` to a syndrome_source; the pointer is
+///                    stored in `event::source`.  Pointers must outlive the
+///                    returned events.
+///
+/// Throws if absolute timestamps go backwards, if no record matches, or if a
+/// record names a `source_id` that is not in `sources`.
 std::vector<event> build_events(const playback_file &file,
                                 std::uint64_t decoder_id,
                                 std::uint64_t tick_ns, bool deltas,
                                 std::size_t *out_skipped = nullptr,
                                 const source_registry &sources = {});
-
-/// Build a run schedule whose syndrome bytes stream from a syndrome_source.
-/// Each shot is laid out as:
-///   reset  (at base tick)
-///   enqueue × rounds_per_shot  (ticks base+1 … base+rounds_per_shot)
-///   get_corrections  (at base + rounds_per_shot + decoder_deadline_ticks)
-///
-/// @param source                  Must outlive the returned events.
-/// @param num_shots               Number of complete shots.
-/// @param tick_ns                 Wall-clock duration of one tick in ns.
-/// @param rounds_per_shot         Enqueue events per shot (default 1).
-/// @param decoder_deadline_ticks  Ticks from last enqueue to get_corrections.
-/// @param shot_gap_ticks          Extra idle ticks after get_corrections before
-///                                the next reset; 0 means one tick.
-std::vector<event>
-build_streaming_events(syndrome_source &source, std::size_t num_shots,
-                       std::uint64_t tick_ns,
-                       std::size_t rounds_per_shot = 1,
-                       std::uint64_t decoder_deadline_ticks = 1,
-                       std::uint64_t shot_gap_ticks = 0);
 
 /// Parse a tick duration written with an explicit unit -- `500ns`, `1us`,
 /// `2.5ms`, `1s` -- into nanoseconds.  `us` may also be spelled `µs`.
@@ -337,6 +346,18 @@ public:
   /// send and stores the value in `record::not_ready_retries`.
   virtual std::uint32_t last_not_ready_retries() const { return 0; }
 
+  /// Non-blocking poll used by `stream_until`: ask the decoder for corrections
+  /// without blocking.  Returns true if corrections landed (the same bits are
+  /// appended to `corrections()` as a normal `get_corrections` would), false
+  /// if the decoder answered NOT_READY.
+  ///
+  /// Sinks that do not support `stream_until` throw `std::logic_error`.  The
+  /// null_sink returns false (source is always exhausted, never "ready").
+  virtual bool try_get_corrections() {
+    throw std::logic_error(
+        "this sink does not support try_get_corrections / stream_until");
+  }
+
   /// Set the NOT_READY retry policy for this sink.
   void set_wait_for_ready(bool v) { wait_for_ready_ = v; }
 
@@ -350,6 +371,8 @@ class null_sink : public sink {
 public:
   void send(const event &e, std::uint64_t tag) override;
   const char *name() const override { return "null"; }
+  /// Always returns false so stream_until exhausts the source completely.
+  bool try_get_corrections() override { return false; }
 
   /// Kept so the compiler cannot optimize the payload read away.
   std::uint64_t checksum() const { return checksum_; }
@@ -379,6 +402,15 @@ struct record {
   /// a width mismatch.  Always false for other operations and for events
   /// without expected bits.
   bool correction_mismatch = false;
+  /// Number of syndrome rounds fed into the decoder by a `stream_until` event.
+  /// Zero for all other operations.
+  std::uint64_t syndromes_streamed = 0;
+  /// True when this event actually took a correction off the decoder: always
+  /// for `get_corrections`, and for `stream_until` only when the decoder
+  /// signalled ready before the source hit EOF.  A false here on a
+  /// stream_until means the source ran dry mid-decode, so no correction was
+  /// produced and none was consumed from `sink::corrections()`.
+  bool read_completed = false;
 };
 
 /// Apply the requested real-time config.  Returns one human-readable warning

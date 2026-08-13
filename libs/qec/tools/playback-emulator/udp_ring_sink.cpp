@@ -170,6 +170,8 @@ public:
     case operation::get_corrections:
       read(e, tag);
       return;
+    case operation::stream_until:
+      return; // handled in run()
     case operation::reset:
       reset(tag);
       return;

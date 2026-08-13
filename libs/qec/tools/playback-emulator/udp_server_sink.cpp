@@ -92,7 +92,35 @@ public:
     case operation::reset:
       reset(tag);
       return;
+    case operation::stream_until:
+      return; // handled in run()
     }
+  }
+
+  bool try_get_corrections() override {
+    wire::GetCorrectionsRequestPayload p{};
+    p.decoder_id   = static_cast<std::int64_t>(decoder_id_);
+    p.return_size  = static_cast<std::int64_t>(observables_);
+    // reset=1 makes the successful poll a CONSUMING read, so stream_until can
+    // stand alone without a following get_corrections.  The server clears the
+    // corrections and returns the session to `collecting`; it does NOT call
+    // reset_decoder(), so the decoder's own accumulated state (and with it the
+    // SIFL feedback loop) survives into the next shot.  A NOT_READY reply
+    // returns before the server reaches the reset branch, so the polls that
+    // fail cost nothing.
+    p.reset        = 1;
+    const auto deadline = std::chrono::steady_clock::now() +
+                          std::chrono::milliseconds(kTimeoutMs);
+    const std::uint32_t id = publish(wire::kGetCorrectionsFunctionId, &p,
+                                     sizeof(p), nullptr, 0, /*awaited=*/true);
+    const std::int32_t status = await(id, "try_get_corrections", deadline);
+    if (status == static_cast<std::int32_t>(wire::RpcStatus::NOT_READY))
+      return false;
+    if (status != 0)
+      throw std::runtime_error(
+          "udp_server_sink::try_get_corrections: status " +
+          std::to_string(status));
+    return true; // bits already collected by dispatch() via await()
   }
 
   const char *name() const override { return "udp_server"; }
@@ -284,7 +312,10 @@ private:
     wire::GetCorrectionsRequestPayload p{};
     p.decoder_id = static_cast<std::int64_t>(decoder_id_);
     p.return_size = static_cast<std::int64_t>(observables_);
-    p.reset = 0;
+    // reset=1: server clears corrections and transitions session back to
+    // collecting without calling reset_decoder(), so bits_since_decode_ in
+    // the decoder is preserved for the next shot.
+    p.reset = 1;
 
     last_not_ready_retries_ = 0;
     const auto deadline = std::chrono::steady_clock::now() +

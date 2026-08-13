@@ -226,7 +226,19 @@ public:
     case operation::reset:
       native_round_trip(e, /*is_read=*/false);
       return;
+    case operation::stream_until:
+      return; // handled in run()
     }
+  }
+
+  bool try_get_corrections() override {
+    const event dummy{};
+    const int32_t status = native_round_trip(dummy, /*is_read=*/true);
+    if (status == 0) return true;
+    if (status == static_cast<int32_t>(wire::RpcStatus::NOT_READY)) return false;
+    throw std::runtime_error(
+        "ring_buffer_injector_sink::try_get_corrections: status " +
+        std::to_string(status));
   }
 
   const char *name() const override { return "ring_buffer_injector"; }

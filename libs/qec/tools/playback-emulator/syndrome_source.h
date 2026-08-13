@@ -12,12 +12,12 @@
 /// @brief Abstract syndrome source and built-in implementations.
 ///
 /// A syndrome_source provides syndrome bits on demand, one round at a time.
-/// The run() timing loop calls next_round() on enqueue events that carry a
-/// source pointer rather than static arena data.
+/// Playback records reference one by `source_id=N`; `build_events` resolves
+/// the ID against a `source_registry` and stores the pointer in `event::source`.
+/// `enqueue` pulls a single round from it, `stream_until` pulls repeatedly.
 
 #include <cstddef>
 #include <cstdint>
-#include <stdexcept>
 #include <string>
 #include <vector>
 

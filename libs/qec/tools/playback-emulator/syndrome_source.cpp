@@ -7,7 +7,6 @@
  ******************************************************************************/
 
 #include "syndrome_source.h"
-#include "playback_emulator.h"
 
 #include "stim.h"
 
@@ -179,46 +178,6 @@ std::size_t stim_memory_source::syndrome_size() const {
 
 std::size_t stim_memory_source::enqueues_per_shot() const {
   return active_.size();
-}
-
-//===----------------------------------------------------------------------===//
-// build_streaming_events
-//===----------------------------------------------------------------------===//
-
-std::vector<event>
-build_streaming_events(syndrome_source &source, std::size_t num_shots,
-                       std::uint64_t tick_ns, std::size_t rounds_per_shot,
-                       std::uint64_t decoder_deadline_ticks,
-                       std::uint64_t shot_gap_ticks) {
-  if (tick_ns == 0)
-    throw std::runtime_error(
-        "build_streaming_events: tick_ns must be non-zero");
-  const std::uint64_t gc_ticks =
-      static_cast<std::uint64_t>(rounds_per_shot) + decoder_deadline_ticks;
-  const std::uint64_t shot_span =
-      gc_ticks + (shot_gap_ticks > 0 ? shot_gap_ticks : 1u);
-
-  std::vector<event> events;
-  events.reserve(num_shots * (2 + rounds_per_shot));
-  for (std::size_t s = 0; s < num_shots; ++s) {
-    const std::uint64_t base_ns = s * shot_span * tick_ns;
-    event ev{};
-    ev.op = operation::reset;
-    ev.offset_ns = base_ns;
-    events.push_back(ev);
-    for (std::size_t r = 0; r < rounds_per_shot; ++r) {
-      ev = {};
-      ev.op = operation::enqueue;
-      ev.source = &source;
-      ev.offset_ns = base_ns + (r + 1) * tick_ns;
-      events.push_back(ev);
-    }
-    ev = {};
-    ev.op = operation::get_corrections;
-    ev.offset_ns = base_ns + gc_ticks * tick_ns;
-    events.push_back(ev);
-  }
-  return events;
 }
 
 } // namespace cudaq::qec::emulator

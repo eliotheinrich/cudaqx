@@ -7,7 +7,6 @@
  ******************************************************************************/
 
 #include "playback_emulator.h"
-#include "syndrome_source.h"
 
 #include <algorithm>
 #include <atomic>
@@ -165,6 +164,8 @@ const char *to_string(operation op) {
     return "get_corrections";
   case operation::reset:
     return "reset";
+  case operation::stream_until:
+    return "stream_until";
   }
   return "?";
 }
@@ -176,6 +177,8 @@ bool parse_operation(const std::string &text, operation &out) {
     out = operation::get_corrections;
   else if (text == "reset")
     out = operation::reset;
+  else if (text == "stream_until")
+    out = operation::stream_until;
   else
     return false;
   return true;
@@ -184,7 +187,9 @@ bool parse_operation(const std::string &text, operation &out) {
 bool takes_syndromes(operation op) { return op == operation::enqueue; }
 
 bool returns_corrections(operation op) {
-  return op == operation::get_corrections;
+  // stream_until absorbs its read: the poll that ends the streaming loop is a
+  // consuming get_corrections, so the bits land in sink::corrections().
+  return op == operation::get_corrections || op == operation::stream_until;
 }
 
 
@@ -305,12 +310,25 @@ playback_file load_playback(const std::string &path) {
       }
     }
 
-    // get_corrections allows an optional expected-correction bit string so the
+    if (rec.op == operation::stream_until) {
+      std::string token;
+      if (!(fields >> token))
+        fail("stream_until needs source_id=N");
+      if (token.rfind("source_id=", 0) != 0)
+        fail("stream_until requires source_id=N, got: " + token);
+      std::uint64_t sid = 0;
+      if (!parse_u64(token.substr(10), sid))
+        fail("source_id= expects a non-negative integer: " + token);
+      rec.source_id = static_cast<std::int64_t>(sid);
+    }
+
+    // Both reading ops allow an optional expected-correction bit string so the
     // emulator can verify the decoder's output in-line, without an out-of-band
-    // diff.  Any other trailing operand is still an error.
+    // diff.  For stream_until this follows the source_id=N token consumed
+    // above.  Any other trailing operand is still an error.
     std::string extra;
     if (fields >> extra) {
-      if (rec.op != operation::get_corrections)
+      if (!returns_corrections(rec.op))
         fail("unexpected trailing operand `" + extra + "` for " +
              to_string(rec.op));
       rec.corrections_offset = file.corrections.size();
@@ -388,11 +406,13 @@ std::vector<event> build_events(const playback_file &file,
     ev.op = rec.op;
     ev.syndrome_data = syndrome_data;
     ev.num_syndromes = rec.syndrome_count;
-    ev.source_id = rec.source_id;
     if (rec.source_id >= 0) {
       const auto it = sources.find(rec.source_id);
-      if (it != sources.end())
-        ev.source = it->second;
+      if (it == sources.end())
+        throw std::runtime_error(
+            "build_events: no source registered for source_id=" +
+            std::to_string(rec.source_id));
+      ev.source = it->second;
     }
     ev.offset_ns = offset * tick_ns;
     ev.corrections_data = corrections_data;
@@ -478,6 +498,31 @@ std::vector<record> run(const std::vector<event> &events, sink &dst,
   std::size_t read_count = 0;
   const std::size_t width = dst.correction_width();
 
+  // Compare the correction just produced against the record's expected bits.
+  // Shared by get_corrections and stream_until: both leave one correction row
+  // in dst.corrections(), indexed by read_count.  A no-op when the record
+  // carried no expectation.
+  const auto verify = [&](record &r, const event &e) {
+    if (e.corrections_data == nullptr)
+      return;
+    if (width == 0 || e.corrections_count != width) {
+      r.correction_mismatch = true;
+      return;
+    }
+    const auto &corr = dst.corrections();
+    const std::size_t base = read_count * width;
+    if (base + width > corr.size()) {
+      r.correction_mismatch = true;
+      return;
+    }
+    for (std::size_t j = 0; j < width; ++j) {
+      if ((corr[base + j] & 1u) != (e.corrections_data[j] & 1u)) {
+        r.correction_mismatch = true;
+        return;
+      }
+    }
+  };
+
   for (std::size_t i = 0; i < events.size(); ++i) {
     const event &e = events[i];
     const std::uint64_t deadline = t0 + e.offset_ns;
@@ -488,6 +533,35 @@ std::vector<record> run(const std::vector<event> &events, sink &dst,
     wait_until(deadline, cfg.spin_slack_ns);
 
     const std::uint64_t call = now_ns();
+
+    if (e.op == operation::stream_until) {
+      record &r = records[i];
+      r.deadline_ns = e.offset_ns;
+      r.call_ns     = call - t0;
+      event enq{}; enq.op = operation::enqueue;
+      std::uint64_t synthetic_tag = 0;
+      bool done = false;
+      while (!done) {
+        auto syndrome = e.source->next_round();
+        if (syndrome.empty()) break;   // source exhausted before decoder finished
+        enq.syndrome_data = syndrome.data();
+        enq.num_syndromes = syndrome.size();
+        dst.send(enq, synthetic_tag++);
+        ++r.syndromes_streamed;
+        // The poll that returns true is a CONSUMING read: the correction bits
+        // are now in dst.corrections(), exactly as a get_corrections would
+        // have left them.  That is what lets stream_until stand alone.
+        done = dst.try_get_corrections();
+      }
+      r.return_ns      = now_ns() - t0;
+      r.read_completed = done;
+      if (done) {
+        verify(r, e);
+        ++read_count;
+      }
+      continue;
+    }
+
     if (e.op == operation::enqueue && e.source != nullptr) {
       auto bytes = e.source->next_round();
       event dyn = e;
@@ -506,24 +580,8 @@ std::vector<record> run(const std::vector<event> &events, sink &dst,
 
     if (e.op == operation::get_corrections) {
       r.not_ready_retries = dst.last_not_ready_retries();
-      if (e.corrections_data != nullptr) {
-        if (width == 0 || e.corrections_count != width) {
-          r.correction_mismatch = true;
-        } else {
-          const auto &corr = dst.corrections();
-          const std::size_t base = read_count * width;
-          if (base + width > corr.size()) {
-            r.correction_mismatch = true;
-          } else {
-            for (std::size_t j = 0; j < width; ++j) {
-              if ((corr[base + j] & 1u) != (e.corrections_data[j] & 1u)) {
-                r.correction_mismatch = true;
-                break;
-              }
-            }
-          }
-        }
-      }
+      r.read_completed    = true;
+      verify(r, e);
       ++read_count;
     }
   }
@@ -606,7 +664,7 @@ void write_csv(const std::string &path,
   if (!out)
     throw std::runtime_error("write_csv: cannot open " + path);
   out << "event,op,deadline_ns,call_ns,return_ns,lateness_ns,latency_ns,"
-         "correction\n";
+         "correction,syndromes_streamed\n";
   std::size_t read_idx = 0;
   for (std::size_t i = 0; i < records.size(); ++i) {
     const auto &r = records[i];
@@ -617,7 +675,10 @@ void write_csv(const std::string &path,
         << r.deadline_ns << ',' << r.call_ns << ','
         << r.return_ns   << ',' << late      << ',' << (r.return_ns - r.call_ns)
         << ',';
-    if (op == operation::get_corrections && correction_width > 0) {
+    // Key off read_completed, not the op: a stream_until whose source ran dry
+    // produced no correction, so advancing read_idx would shift every later
+    // row's bits by one.
+    if (r.read_completed && correction_width > 0) {
       const std::size_t base = read_idx * correction_width;
       if (base + correction_width <= corrections.size()) {
         for (std::size_t j = 0; j < correction_width; ++j)
@@ -629,7 +690,7 @@ void write_csv(const std::string &path,
     } else {
       out << '-';
     }
-    out << '\n';
+    out << ',' << r.syndromes_streamed << '\n';
   }
 }
 
