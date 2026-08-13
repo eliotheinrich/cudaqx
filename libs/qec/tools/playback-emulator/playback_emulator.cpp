@@ -7,6 +7,7 @@
  ******************************************************************************/
 
 #include "playback_emulator.h"
+#include "syndrome_source.h"
 
 #include <algorithm>
 #include <atomic>
@@ -279,22 +280,29 @@ playback_file load_playback(const std::string &path) {
       fail("decoder_id is not an unsigned integer: " + decoder_text);
 
     if (takes_syndromes(rec.op)) {
-      std::string bits_text;
-      if (!(fields >> bits_text))
-        fail(std::string(to_string(rec.op)) + " needs a syndrome bit string");
-      rec.syndrome_offset = file.syndromes.size();
-      for (const char c : bits_text) {
-        if (c != '0' && c != '1')
-          fail(std::string("syndrome data must be `0`/`1` characters, got `") +
-               c + "` in: " + bits_text);
-        file.syndromes.push_back(static_cast<std::uint8_t>(c - '0'));
+      std::string token;
+      if (!(fields >> token))
+        fail(std::string(to_string(rec.op)) +
+             " needs a syndrome bit string or source_id=N");
+      if (token.rfind("source_id=", 0) == 0) {
+        std::uint64_t sid = 0;
+        if (!parse_u64(token.substr(10), sid))
+          fail("source_id= expects a non-negative integer: " + token);
+        rec.source_id = static_cast<std::int64_t>(sid);
+      } else {
+        rec.syndrome_offset = file.syndromes.size();
+        for (const char c : token) {
+          if (c != '0' && c != '1')
+            fail(std::string("syndrome data must be `0`/`1` characters, got `") +
+                 c + "` in: " + token);
+          file.syndromes.push_back(static_cast<std::uint8_t>(c - '0'));
+        }
+        rec.syndrome_count = token.size();
+        if (rec.syndrome_count > kMaxSyndromeBits)
+          fail("syndrome is " + std::to_string(rec.syndrome_count) +
+               " bits, over the " + std::to_string(kMaxSyndromeBits) +
+               "-bit wire cap");
       }
-      rec.syndrome_count = bits_text.size();
-      if (rec.syndrome_count > kMaxSyndromeBits)
-        fail("syndrome is " + std::to_string(rec.syndrome_count) +
-             " bits, over the " +
-             std::to_string(kMaxSyndromeBits) +
-             "-bit wire cap");
     }
 
     // get_corrections allows an optional expected-correction bit string so the
@@ -326,7 +334,8 @@ playback_file load_playback(const std::string &path) {
 std::vector<event> build_events(const playback_file &file,
                                 std::uint64_t decoder_id,
                                 std::uint64_t tick_ns, bool deltas,
-                                std::size_t *out_skipped) {
+                                std::size_t *out_skipped,
+                                const source_registry &sources) {
   if (tick_ns == 0)
     throw std::runtime_error("build_events: tick duration must be non-zero");
   std::vector<event> events;
@@ -362,7 +371,7 @@ std::vector<event> build_events(const playback_file &file,
     seen = true;
 
     const std::uint8_t *syndrome_data =
-        takes_syndromes(rec.op)
+        (takes_syndromes(rec.op) && rec.source_id < 0)
             ? file.syndromes.data() + rec.syndrome_offset
             : nullptr;
     const std::uint8_t *corrections_data =
@@ -375,8 +384,20 @@ std::vector<event> build_events(const playback_file &file,
       throw std::runtime_error(
           "build_events: tick " + std::to_string(offset) + " x " +
           std::to_string(tick_ns) + " ns overflows the schedule");
-    events.push_back({rec.op, syndrome_data, rec.syndrome_count,
-                      offset * tick_ns, corrections_data, rec.corrections_count});
+    event ev{};
+    ev.op = rec.op;
+    ev.syndrome_data = syndrome_data;
+    ev.num_syndromes = rec.syndrome_count;
+    ev.source_id = rec.source_id;
+    if (rec.source_id >= 0) {
+      const auto it = sources.find(rec.source_id);
+      if (it != sources.end())
+        ev.source = it->second;
+    }
+    ev.offset_ns = offset * tick_ns;
+    ev.corrections_data = corrections_data;
+    ev.corrections_count = rec.corrections_count;
+    events.push_back(ev);
   }
 
   if (events.empty())
@@ -467,7 +488,15 @@ std::vector<record> run(const std::vector<event> &events, sink &dst,
     wait_until(deadline, cfg.spin_slack_ns);
 
     const std::uint64_t call = now_ns();
-    dst.send(e, i);
+    if (e.op == operation::enqueue && e.source != nullptr) {
+      auto bytes = e.source->next_round();
+      event dyn = e;
+      dyn.syndrome_data = bytes.data();
+      dyn.num_syndromes = bytes.size();
+      dst.send(dyn, i);
+    } else {
+      dst.send(e, i);
+    }
     const std::uint64_t returned = now_ns();
 
     record &r = records[i];

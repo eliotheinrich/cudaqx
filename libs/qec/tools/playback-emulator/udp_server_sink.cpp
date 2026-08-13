@@ -9,39 +9,14 @@
 /// @file udp_server_sink.cpp
 /// @brief The default UDP producer: the decoding RPCs over a plain socket.
 ///
-/// The ring in the retired udp_ring_sink is the RoCE interface shape (see udp_wrapper.h):
-/// on an RDMA NIC the hardware writes arriving frames straight into registered
-/// slots, so a ring is what you poll.  Over UDP the client gets nothing from
-/// it.  Both peers own separate rings joined by datagrams, so a slot index is
-/// meaningful only locally, and "the reply lands in the slot I published to"
-/// degrades from a shared-memory fact into a convention that one out-of-order
-/// reply breaks permanently -- with nothing in the frame to re-establish it.
-///
-/// So this sink drops the client-side ring entirely.  The kernel's socket
-/// receive queue is the inbound queue: deeper than any ring we would size, and
-/// it never needs recycling, claiming or lap accounting.  There is no
-/// --server-slots to get wrong, because there is no ring.
-///
-/// Reply handling is a FIFO pipeline, not a search for one answer:
+/// Reply handling is a FIFO pipeline
 ///
 ///   * every request is recorded in `pending_` in publish order;
 ///   * `pump()` retires exactly one reply, in arrival order, and hands it to
-///     `dispatch()`, which acts on it according to the request it answers --
-///     enqueue ACKs carry nothing and are retired, get_corrections replies have
-///     their correction bits collected;
+///     `dispatch()`, which acts on it according to the request it answers 
 ///   * a caller that needs an answer blocks in `await()`, which pumps the queue
-///     rather than sifting it.  NOTHING IS DISCARDED: every reply is dispatched
-///     for its own sake, so a reply arriving while another request is
+///     rather than sifting it. A reply arriving while another request is
 ///     outstanding is still acted on.
-///
-/// That last point is what makes this extensible.  A richer RPC protocol adds
-/// a case to `dispatch()` and nothing else; an unrecognized reply raises rather
-/// than being dropped, so a protocol addition cannot go silently unhandled.
-///
-/// The wire format is byte-identical to udp_ring_sink: one datagram carries
-/// one full slot stride, which is what the server's transceiver expects (it
-/// drops anything longer than its own page_size).  A playback file and its
-/// statistics carry across between the two sinks unchanged.
 
 #include "sinks.h"
 
@@ -80,8 +55,7 @@ public:
       throw std::runtime_error("udp_server_sink: socket() failed");
 
     // A generous receive buffer is this sink's entire flow-control story: it
-    // is where replies wait while we stream enqueues, and it is why no ring
-    // depth has to be chosen.  The kernel doubles what we ask for.
+    // is where replies wait while we stream enqueues.
     const int rcvbuf = 8 << 20;
     ::setsockopt(fd_, SOL_SOCKET, SO_RCVBUF, &rcvbuf, sizeof(rcvbuf));
 
@@ -146,7 +120,7 @@ public:
 private:
   /// A request that has gone out and not yet been answered, in publish order.
   /// `awaited` marks the ones whose status a caller is blocking for; the rest
-  /// (streamed enqueues) are retired and forgotten.
+  /// are retired and forgotten.
   struct pending {
     std::uint32_t id;
     std::uint32_t function_id;
@@ -191,10 +165,10 @@ private:
 
   /// Act on one reply, according to the request it answers.
   ///
-  /// This is the whole of the protocol's client-side behaviour, and the single
-  /// place a new RPC needs a case.  It runs for EVERY reply, including ones
-  /// nobody is blocked on, so a reply is never dropped merely because it
-  /// arrived while a different request was outstanding.
+  /// This is the whole of the protocol's client-side behaviour.
+  /// It runs for EVERY reply, including ones nobody is blocked on, so a reply
+  /// is never dropped merely because it arrived while a different request was
+  /// outstanding.
   void dispatch(const pending &req,
                 const cudaq::realtime::RPCResponse *response,
                 const std::uint8_t *frame) {
@@ -369,6 +343,7 @@ private:
   std::uint64_t observables_;
   std::vector<std::uint8_t> tx_, rx_;
   std::uint32_t next_id_ = 1;
+
   /// Outstanding requests in publish order, and the statuses of the retired
   /// ones a caller is still blocking for.
   std::deque<pending> pending_;

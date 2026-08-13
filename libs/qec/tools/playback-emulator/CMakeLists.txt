@@ -34,6 +34,7 @@ if(NOT QEC_UDP_TRANSPORT_LIBRARY)
 endif()
 
 set(_PE_SOURCES
+  ${CMAKE_CURRENT_SOURCE_DIR}/syndrome_source.cpp
   ${CMAKE_CURRENT_SOURCE_DIR}/playback_emulator.cpp
   ${CMAKE_CURRENT_SOURCE_DIR}/ring_buffer_injector_sink.cpp
   ${CMAKE_CURRENT_SOURCE_DIR}/udp_server_sink.cpp
@@ -47,6 +48,9 @@ set(_PE_INCLUDE_DIRS
   # qec_realtime_session.h and rpc_producer.h are private headers in lib/realtime/;
   # reached directly because this tool is in-tree (see ring_buffer_injector_sink.cpp).
   ${CMAKE_CURRENT_SOURCE_DIR}/../../lib/realtime
+  # stim.h for StimCircuitSource / StimMemorySource in syndrome_source.cpp.
+  # stim_SOURCE_DIR is set by FetchContent_MakeAvailable(stim) in libs/qec/lib/.
+  ${stim_SOURCE_DIR}/src
 )
 
 set(_PE_LINK_LIBS
@@ -59,6 +63,7 @@ set(_PE_LINK_LIBS
   cudaq-mlir-runtime
   nvqir
   nvqir-stim
+  libstim
   CUDA::cudart
 )
 

@@ -26,6 +26,8 @@
 /// This header is deliberately free of CUDA-Q dependencies so the timing core
 /// can be built and characterized (against `null_sink`) on any machine.
 
+#include "syndrome_source.h"
+
 #include <cstdint>
 #include <map>
 #include <string>
@@ -155,7 +157,7 @@ struct playback_record {
   operation op;
   std::uint64_t decoder_id;
   /// Syndrome bits: index into `playback_file::syndromes` and byte count.
-  /// Both are 0 for non-enqueue records.
+  /// Both are 0 for non-enqueue records and for source-referenced enqueues.
   std::size_t syndrome_offset;
   std::uint64_t syndrome_count;
   /// Optional expected correction bits, parallel to the syndrome fields.
@@ -166,6 +168,9 @@ struct playback_record {
   /// that line.
   std::size_t corrections_offset;
   std::uint64_t corrections_count;
+  /// Source ID for enqueue records that carry `source_id=N` instead of inline
+  /// bits.  -1 means the syndrome data is inline in the arena.
+  std::int64_t source_id = -1;
 };
 
 /// Metadata parsed from `# PLAYBACK_META` header lines.  Zero means "not
@@ -192,11 +197,21 @@ struct event {
   operation op;
   /// Into `playback_file::syndromes`.  One bit per byte (0x00/0x01), which is
   /// the shape `rpc_producer::enqueue_syndromes` wants.  Null unless
-  /// `takes_syndromes(op)`.
+  /// `takes_syndromes(op)`.  Also null for source-backed enqueue events; in
+  /// that case `source` is non-null and `run()` calls `source->next_round()`.
   const std::uint8_t *syndrome_data;
   /// Syndrome bit count (same as the byte length of `syndrome_data` due to
-  /// the one-bit-per-byte layout).
+  /// the one-bit-per-byte layout).  0 for source-backed events until resolved.
   std::uint64_t num_syndromes;
+  /// Non-null for dynamically sourced enqueue events.  `run()` calls
+  /// `source->next_round()` just before firing and uses the returned bytes.
+  /// Null for all static (playback-file-backed) events.
+  syndrome_source *source = nullptr;
+  /// Source ID carried from `playback_record::source_id`.  -1 for inline-bit
+  /// events and for events built by `build_streaming_events`.  Non-negative
+  /// values allow the Python binding to pre-generate data from unregistered
+  /// (duck-typed) sources after `build_events` returns.
+  std::int64_t source_id = -1;
   std::uint64_t offset_ns;
   /// Optional expected correction bits, populated from `playback_record::
   /// corrections_offset/corrections_count`.  Null (and corrections_count == 0)
@@ -207,6 +222,11 @@ struct event {
   const std::uint8_t *corrections_data = nullptr;
   std::uint64_t corrections_count = 0;
 };
+
+/// Maps source IDs (from `source_id=N` playback lines) to syndrome sources.
+/// Passed to `build_events` so enqueue records with a source reference get
+/// their `event::source` pointer resolved at load time.
+using source_registry = std::map<std::int64_t, syndrome_source *>;
 
 /// Parse a playback file.  Throws `std::runtime_error` naming the file and line
 /// on any malformed record.
@@ -232,10 +252,35 @@ playback_file load_playback(const std::string &path);
 ///                    an empty file.
 ///
 /// Throws if absolute timestamps go backwards, or if no record matches.
+/// @param sources  Optional registry mapping source IDs to syndrome_source
+///                 pointers.  When an enqueue record carries `source_id=N`,
+///                 the matching source pointer is stored in `event::source`.
+///                 Pointers must outlive the returned events.
 std::vector<event> build_events(const playback_file &file,
                                 std::uint64_t decoder_id,
                                 std::uint64_t tick_ns, bool deltas,
-                                std::size_t *out_skipped = nullptr);
+                                std::size_t *out_skipped = nullptr,
+                                const source_registry &sources = {});
+
+/// Build a run schedule whose syndrome bytes stream from a syndrome_source.
+/// Each shot is laid out as:
+///   reset  (at base tick)
+///   enqueue × rounds_per_shot  (ticks base+1 … base+rounds_per_shot)
+///   get_corrections  (at base + rounds_per_shot + decoder_deadline_ticks)
+///
+/// @param source                  Must outlive the returned events.
+/// @param num_shots               Number of complete shots.
+/// @param tick_ns                 Wall-clock duration of one tick in ns.
+/// @param rounds_per_shot         Enqueue events per shot (default 1).
+/// @param decoder_deadline_ticks  Ticks from last enqueue to get_corrections.
+/// @param shot_gap_ticks          Extra idle ticks after get_corrections before
+///                                the next reset; 0 means one tick.
+std::vector<event>
+build_streaming_events(syndrome_source &source, std::size_t num_shots,
+                       std::uint64_t tick_ns,
+                       std::size_t rounds_per_shot = 1,
+                       std::uint64_t decoder_deadline_ticks = 1,
+                       std::uint64_t shot_gap_ticks = 0);
 
 /// Parse a tick duration written with an explicit unit -- `500ns`, `1us`,
 /// `2.5ms`, `1s` -- into nanoseconds.  `us` may also be spelled `µs`.
