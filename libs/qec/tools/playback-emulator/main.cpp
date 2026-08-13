@@ -53,7 +53,6 @@ struct options {
   std::size_t decoder_id = 0;
   std::string server_host = "127.0.0.1";
   int server_port = 0;
-  int server_slots = 8;
   int server_slot_size = 256;
   int server_observables = 1;
   bool deltas = false;
@@ -69,10 +68,8 @@ struct options {
   std::fprintf(
       code ? stderr : stdout,
       "usage: qec_playback_emulator --playback=<file>\n"
-      "                           [--sink=null|ring_buffer_injector|udp_server|\n"
-      "                                   udp_ring]\n"
+      "                           [--sink=null|ring_buffer_injector|udp_server]\n"
       "                           [--server-host=H] [--server-port=N]\n"
-      "                           [--server-slots=N]  (udp_ring only)\n"
       "                           [--server-slot-size=N]\n"
       "                           [--server-observables=N]\n"
       "                           [--config=<decoders.yaml>] [--decoder-id=N]\n"
@@ -119,8 +116,6 @@ options parse_args(int argc, char **argv) {
       opts.server_host = value;
     else if (match(arg, "server-port", value))
       opts.server_port = std::stoi(value);
-    else if (match(arg, "server-slots", value))
-      opts.server_slots = std::stoi(value);
     else if (match(arg, "server-slot-size", value))
       opts.server_slot_size = std::stoi(value);
     else if (match(arg, "server-observables", value))
@@ -170,10 +165,9 @@ options parse_args(int argc, char **argv) {
                          "e.g. 500ns, 1us, 2.5ms, 1s\n", opts.tick.c_str());
     usage(1);
   }
-  // Both remote sinks talk to a server rather than owning a decoder, so they
-  // want a port and never a config.
-  const bool remote =
-      opts.sink_name == "udp_server" || opts.sink_name == "udp_ring";
+  // The remote sink talks to a server rather than owning a decoder, so it
+  // wants a port and never a config.
+  const bool remote = opts.sink_name == "udp_server";
   if (remote && opts.server_port == 0) {
     std::fprintf(stderr, "--sink=%s requires --server-port=<N> "
                          "(the port= from the server's READY line)\n",
@@ -223,12 +217,6 @@ int main(int argc, char **argv) try {
     dst = make_udp_server_sink(
         opts.server_host, static_cast<std::uint16_t>(opts.server_port),
         opts.decoder_id, static_cast<std::uint32_t>(opts.server_slot_size),
-        static_cast<std::uint64_t>(opts.server_observables));
-  else if (opts.sink_name == "udp_ring")
-    dst = make_udp_ring_sink(
-        opts.server_host, static_cast<std::uint16_t>(opts.server_port),
-        opts.decoder_id, static_cast<std::uint32_t>(opts.server_slots),
-        static_cast<std::uint32_t>(opts.server_slot_size),
         static_cast<std::uint64_t>(opts.server_observables));
   else {
     std::fprintf(stderr, "unknown --sink: %s\n", opts.sink_name.c_str());

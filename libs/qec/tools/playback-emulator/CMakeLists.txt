@@ -36,9 +36,9 @@ endif()
 set(_PE_SOURCES
   ${CMAKE_CURRENT_SOURCE_DIR}/syndrome_source.cpp
   ${CMAKE_CURRENT_SOURCE_DIR}/playback_emulator.cpp
+  ${CMAKE_CURRENT_SOURCE_DIR}/rpc_call.cpp
   ${CMAKE_CURRENT_SOURCE_DIR}/ring_buffer_injector_sink.cpp
   ${CMAKE_CURRENT_SOURCE_DIR}/udp_server_sink.cpp
-  ${CMAKE_CURRENT_SOURCE_DIR}/udp_ring_sink.cpp
 )
 
 set(_PE_INCLUDE_DIRS

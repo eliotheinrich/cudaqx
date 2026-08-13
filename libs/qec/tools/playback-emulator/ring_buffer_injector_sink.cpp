@@ -8,12 +8,12 @@
 
 #include "sinks.h"
 
+#include "rpc_call.h"
+
 #include "cudaq/qec/decoder.h"
 #include "cudaq/qec/pcm_utils.h"
-#include "cudaq/qec/realtime/decoder_rpc_wire_format.h"
 #include "cudaq/qec/realtime/decoding_config.h"
 #include "cudaq/realtime/daemon/dispatcher/cpu_relax.h"
-#include "cudaq/realtime/daemon/dispatcher/dispatch_kernel_launch.h"
 
 // Internal headers: the producer entry point and the session that owns the
 // ring live in lib/, not include/.  The tool is in-tree, so reach them
@@ -35,29 +35,33 @@ namespace cudaq::qec::emulator {
 namespace {
 
 namespace config = cudaq::qec::decoding::config;
-namespace wire = cudaq::qec::decoding::rpc;
 
-/// Writes `enqueue_syndromes` frames straight into the session's RX ring and
-/// returns without waiting for the ACK.
+/// Publishes fully-serialized RPC frames straight into the session's ring
+/// slots.  `transport()` is what makes this sink different from
+/// `udp_server_sink`: both build the same `rpc_call` (in `sink::send`/
+/// `try_get_corrections`); this class only knows how to get those bytes into
+/// a ring slot and, for blocking calls, wait for the reply.
 ///
-/// Wire format is byte-identical to `rpc_producer::enqueue_syndromes` (24-byte
-/// RPCHeader, then a 32-byte EnqueueRequestPayload, then the bit-packed
-/// syndrome bits, LSB-first).  What differs is the slot discipline: the cursor
-/// advances every call, and a slot is reclaimed only when it comes back around
-/// for reuse.  So the ring runs at depth `num_slots` instead of depth 1 and the
-/// producer stalls only when the dispatcher is genuinely a full lap behind.
+/// A non-blocking call (enqueue) publishes and returns without waiting for
+/// the ACK: the cursor advances every call and a slot is reclaimed only when
+/// it comes back around, so the ring runs at depth `num_slots` and stalls
+/// only when the dispatcher is a full lap behind.  A blocking call
+/// (get_corrections, reset) publishes into the cursor slot and spins on the
+/// TX doorbell exactly as `reclaim()` does, costing the ring turnaround
+/// (~2 us) instead of `rpc_producer`'s 200 us poll granularity; on NOT_READY
+/// it returns that status rather than retrying, which is the base class's job.
 ///
-/// The injector does NOT go through `rpc_producer` -- it reimplements the wire
-/// format against the session's public ring accessors, leaving that file
-/// untouched, and therefore does not inherit rpc_producer's process-global
-/// single-producer guard.  The same one-emulator-process-per-source rule still
-/// applies: `qec_realtime_session::initialize()` rejects a second concurrent
-/// HOST-mode session.
+/// Writes into the session's public ring accessors directly rather than
+/// through `rpc_producer`, so it does not inherit that library's
+/// process-global single-producer guard.  The same one-emulator-process-per-
+/// source rule still applies: `qec_realtime_session::initialize()` rejects a
+/// second concurrent HOST-mode session.
 class ring_buffer_injector_sink : public sink {
 public:
   ring_buffer_injector_sink(const std::string &config_path,
                             std::size_t decoder_id,
-                            const std::string &dem_file = "") {
+                            const std::string &dem_file = "")
+      : sink(kWireDecoderId, /*num_observables=*/0) {
     // ---- Realize one decoder from the YAML config --------------------------
     std::ifstream in(config_path);
     if (!in)
@@ -78,23 +82,18 @@ public:
 
     syndrome_size_ = match->syndrome_size;
     // Observables are the -1 column terminators in the sparse O matrix, the
-    // same way realtime_decoding.cpp derives it.
-    num_observables_ = static_cast<std::uint64_t>(
-        std::count(match->O_sparse.begin(), match->O_sparse.end(), -1));
-    // Preallocate the read-back buffer so get_corrections never allocates on
-    // the timing thread; the headroom leaves room for oversize test requests.
-    corrections_.assign(std::max<std::size_t>(num_observables_, 1024), 0);
+    // same way realtime_decoding.cpp derives it.  The base class only learns
+    // this now -- it cannot be passed to the base constructor's member-init
+    // list because it comes from parsing this YAML file.
+    set_num_observables(static_cast<std::uint64_t>(
+        std::count(match->O_sparse.begin(), match->O_sparse.end(), -1)));
 
     // Mirrors realtime_decoding.cpp::create_realtime_decoder: build the parity
     // check matrix from the sparse config, realize the plugin, and attach the
-    // observable / detector maps the decode path expects.
-    // Use the library's own parameter preparation rather than re-deriving it:
-    // it materializes `O` for trt_decoder, synthesizes an empty
-    // `global_decoder_params` when one is missing, and -- the part that matters
-    // here -- reads `stim_dem_path` and forwards the model text down as
-    // `global_decoder_params.stim_dem` so a DEM-native GLOBAL decoder
-    // (chromobius behind a TRT predecoder) can be constructed.  Duplicating
-    // that logic is how this sink previously silently dropped the DEM.
+    // observable/detector maps the decode path expects.  Reuse the library's
+    // own parameter preparation rather than re-deriving it, so a DEM-native
+    // GLOBAL decoder (chromobius behind a TRT predecoder) gets its model text
+    // forwarded correctly as `global_decoder_params.stim_dem`.
     auto params =
         cudaq::qec::decoding::host::prepare_decoder_params(*match);
     if (match->cuda_device_id.has_value())
@@ -187,76 +186,16 @@ public:
     cudaq::qec::decoding::rpc_producer::reset_decoder(*session_, kWireDecoderId);
   }
 
-  void send(const event &e, std::uint64_t tag) override {
-    switch (e.op) {
-    case operation::enqueue:
-      stream_enqueue(e, tag);
-      return;
-    case operation::get_corrections: {
-      // A read must BLOCK for its result, but it must not SLEEP for it.  We
-      // publish the request and watch the TX doorbell exactly as reclaim()
-      // already watches it, so the wait costs the ring turnaround (~2 us)
-      // instead of rpc_producer's 200 us poll granularity.
-      last_not_ready_retries_ = 0;
-      const auto deadline = std::chrono::steady_clock::now() +
-                            std::chrono::milliseconds(kReclaimTimeoutMs);
-      while (true) {
-        const auto status = native_round_trip(e, /*is_read=*/true);
-        if (status == 0)
-          return;
-        if (status == static_cast<int32_t>(wire::RpcStatus::NOT_READY)) {
-          ++last_not_ready_retries_;
-          if (!wait_for_ready_)
-            throw std::runtime_error(
-                "ring_buffer_injector_sink: get_corrections returned NOT_READY "
-                "(the schedule may be too tight; use --wait-for-ready to retry "
-                "until the decoder is done)");
-          if (std::chrono::steady_clock::now() >= deadline)
-            throw std::runtime_error(
-                "ring_buffer_injector_sink: wait_for_ready timed out after " +
-                std::to_string(kReclaimTimeoutMs) + " ms");
-          CUDAQ_REALTIME_CPU_RELAX();
-          continue;
-        }
-        throw std::runtime_error(
-            "ring_buffer_injector_sink: get_corrections returned status " +
-            std::to_string(status));
-      }
-    }
-    case operation::reset:
-      native_round_trip(e, /*is_read=*/false);
-      return;
-    case operation::stream_until:
-      return; // handled in run()
-    }
-  }
-
-  bool try_get_corrections() override {
-    const event dummy{};
-    const int32_t status = native_round_trip(dummy, /*is_read=*/true);
-    if (status == 0) return true;
-    if (status == static_cast<int32_t>(wire::RpcStatus::NOT_READY)) return false;
-    throw std::runtime_error(
-        "ring_buffer_injector_sink::try_get_corrections: status " +
-        std::to_string(status));
-  }
-
   const char *name() const override { return "ring_buffer_injector"; }
 
-  const std::vector<std::uint8_t> &corrections() const override {
-    return corrections_log_;
-  }
-
-  std::size_t correction_width() const override { return num_observables_; }
   std::size_t syndrome_size() const override { return syndrome_size_; }
-  std::uint32_t last_not_ready_retries() const override { return last_not_ready_retries_; }
 
   void report() const override {
     if (corrections_read_) {
       std::string last(num_observables_, '0');
-      const std::size_t base = corrections_log_.size() - num_observables_;
+      const std::size_t base = corrections().size() - num_observables_;
       for (std::size_t i = 0; i < num_observables_; ++i)
-        last[i] = static_cast<char>('0' + corrections_log_[base + i]);
+        last[i] = static_cast<char>('0' + corrections()[base + i]);
       std::printf("corrections       reads=%llu width=%llu last=%s\n",
                   static_cast<unsigned long long>(corrections_read_),
                   static_cast<unsigned long long>(num_observables_),
@@ -273,13 +212,70 @@ public:
                 static_cast<unsigned long long>(rpc_errors_), num_slots_);
   }
 
+protected:
+  std::int32_t transport(const rpc_call &call,
+                         std::uint8_t *result_buf) override {
+    const std::uint32_t slot = cursor();
+    require_slot(slot);
+    std::uint8_t *rx_slot = session_->rx_data_host() + slot * slot_size_;
+    // request_id is the caller's event tag for enqueue (a useful breadcrumb);
+    // for blocking calls it's just `sent_` since nothing matches replies by
+    // id here -- the ring is strict-FIFO, one request per slot.
+    const std::uint32_t request_id = call.blocking
+        ? static_cast<std::uint32_t>(sent_)
+        : static_cast<std::uint32_t>(call.tag);
+    serialize_rpc_frame(call, request_id, rx_slot, slot_size_);
+    publish(slot);
+    session_->set_producer_cursor((slot + 1u) % num_slots_);
+
+    if (!call.blocking) {
+      ++sent_;
+      return 0;
+    }
+
+    // Watch the TX doorbell instead of sleeping through it -- see reclaim().
+    std::uint8_t *tx_slot = session_->tx_data_host() + slot * slot_size_;
+    const auto *response =
+        reinterpret_cast<const cudaq::realtime::RPCResponse *>(tx_slot);
+    volatile std::uint64_t *tx = session_->tx_flags_host();
+    const auto deadline = std::chrono::steady_clock::now() +
+                          std::chrono::milliseconds(kReclaimTimeoutMs);
+    while (true) {
+      __sync_synchronize();
+      if (response->magic == cudaq::realtime::RPC_MAGIC_RESPONSE &&
+          tx[slot] != 0)
+        break;
+      if (std::chrono::steady_clock::now() >= deadline)
+        throw std::runtime_error(
+            "ring_buffer_injector_sink: timed out waiting for a response in "
+            "slot " + std::to_string(slot) + " after " +
+            std::to_string(kReclaimTimeoutMs) + " ms");
+      CUDAQ_REALTIME_CPU_RELAX();
+    }
+
+    const int32_t status = response->status;
+    if (status == 0) {
+      if (call.expected_result_bits > 0) {
+        // Result body is bit-packed LSB-first, right after the 24-byte
+        // response.  unpack_and_log_corrections (in sink::dispatch_once)
+        // reads it back out of result_buf once transport() returns.
+        const std::uint8_t *packed =
+            tx_slot + sizeof(cudaq::realtime::RPCResponse);
+        std::memcpy(result_buf, packed,
+                    wire::bit_packed_bytes(call.expected_result_bits));
+        ++corrections_read_;
+      }
+      ++synchronous_ops_;
+    }
+    release_response(slot);
+    return status;
+  }
+
 private:
-  /// Wire routing key, NOT the YAML `id`.  The two are different things: the
-  /// YAML id selects which config entry to realize, while the routing key
-  /// indexes the session's own decoder vector.  `qec_realtime_session::
-  /// initialize()` stamps `routing_key = 0` into the function table, so a
-  /// one-decoder session only ever answers key 0 -- sending the YAML id here
-  /// instead gets `non-zero status (1)` back from the dispatcher.
+  /// Wire routing key, NOT the YAML `id`: the YAML id selects which config
+  /// entry to realize, while `qec_realtime_session::initialize()` stamps
+  /// `routing_key = 0` for a one-decoder session, which only ever answers
+  /// key 0.
   static constexpr std::size_t kWireDecoderId = 0;
 
   /// Bound on the credit wait, mirroring rpc_producer's kAcquireSlotTimeoutMs.
@@ -293,14 +289,6 @@ private:
     return static_cast<std::uint32_t>(session_->producer_cursor() % num_slots_);
   }
 
-  void stream_enqueue(const event &e, std::uint64_t tag) {
-    const std::uint32_t slot = cursor();
-    require_slot(slot);
-    write_frame(slot, e, tag);
-    session_->set_producer_cursor((slot + 1u) % num_slots_);
-    ++sent_;
-  }
-
   void require_slot(std::uint32_t slot) {
     if (!reclaim(slot, kReclaimTimeoutMs))
       throw std::runtime_error(
@@ -308,6 +296,13 @@ private:
           std::to_string(slot) + " after " +
           std::to_string(kReclaimTimeoutMs) +
           " ms; the dispatcher has stopped servicing the ring");
+  }
+
+  /// Address-as-flag publish, matching rpc_producer::write_and_signal.
+  void publish(std::uint32_t slot) {
+    __sync_synchronize();
+    session_->rx_flags_host()[slot] = reinterpret_cast<std::uint64_t>(
+        session_->rx_data_dev() + slot * slot_size_);
   }
 
   /// Wait until `slot` is reusable, reclaiming it if the dispatcher has already
@@ -346,89 +341,6 @@ private:
     return true;
   }
 
-  /// Publish a request into the cursor slot and spin until its response lands,
-  /// then consume it.  Returns the response status code (0 == OK).  Never
-  /// throws on a non-zero status so the send() loop can retry on NOT_READY.
-  ///
-  /// `is_read` selects get_corrections (17-byte payload, packed result body)
-  /// over reset_decoder (8-byte payload, empty ACK).
-  int32_t native_round_trip(const event &, bool is_read) {
-    const std::uint64_t n = num_observables_;
-    const std::uint32_t slot = cursor();
-    require_slot(slot);
-
-    std::uint8_t *rx_slot = session_->rx_data_host() + slot * slot_size_;
-    std::size_t body = 0;
-    std::uint32_t function_id = 0;
-    if (is_read) {
-      body = sizeof(wire::GetCorrectionsRequestPayload);
-      function_id = wire::kGetCorrectionsFunctionId;
-    } else {
-      body = sizeof(wire::ResetRequestPayload);
-      function_id = wire::kResetDecoderFunctionId;
-    }
-    std::memset(rx_slot, 0, sizeof(cudaq::realtime::RPCHeader) + body);
-    auto *header = reinterpret_cast<cudaq::realtime::RPCHeader *>(rx_slot);
-    header->magic = cudaq::realtime::RPC_MAGIC_REQUEST;
-    header->function_id = function_id;
-    header->arg_len = static_cast<std::uint32_t>(body);
-    header->request_id = static_cast<std::uint32_t>(sent_);
-    header->ptp_timestamp = 0;
-
-    std::uint8_t *args = rx_slot + sizeof(cudaq::realtime::RPCHeader);
-    if (is_read) {
-      auto *p = reinterpret_cast<wire::GetCorrectionsRequestPayload *>(args);
-      p->decoder_id = static_cast<std::int64_t>(kWireDecoderId);
-      p->return_size = static_cast<std::int64_t>(n);
-      p->reset = 0;
-    } else {
-      auto *p = reinterpret_cast<wire::ResetRequestPayload *>(args);
-      p->decoder_id = static_cast<std::int64_t>(kWireDecoderId);
-    }
-
-    __sync_synchronize();
-    session_->rx_flags_host()[slot] = reinterpret_cast<std::uint64_t>(
-        session_->rx_data_dev() + slot * slot_size_);
-    session_->set_producer_cursor((slot + 1u) % num_slots_);
-
-    // Watch for the reply instead of sleeping through it.
-    std::uint8_t *tx_slot = session_->tx_data_host() + slot * slot_size_;
-    const auto *response =
-        reinterpret_cast<const cudaq::realtime::RPCResponse *>(tx_slot);
-    volatile std::uint64_t *tx = session_->tx_flags_host();
-    const auto deadline = std::chrono::steady_clock::now() +
-                          std::chrono::milliseconds(kReclaimTimeoutMs);
-    while (true) {
-      __sync_synchronize();
-      if (response->magic == cudaq::realtime::RPC_MAGIC_RESPONSE &&
-          tx[slot] != 0)
-        break;
-      if (std::chrono::steady_clock::now() >= deadline)
-        throw std::runtime_error(
-            "ring_buffer_injector_sink: timed out waiting for a response in "
-            "slot " + std::to_string(slot) + " after " +
-            std::to_string(kReclaimTimeoutMs) + " ms");
-      CUDAQ_REALTIME_CPU_RELAX();
-    }
-    const int32_t status = response->status;
-    if (status != 0) {
-      release_response(slot);
-      return status;
-    }
-
-    if (is_read) {
-      // Result body is bit-packed LSB-first, right after the 24-byte response.
-      const std::uint8_t *packed =
-          tx_slot + sizeof(cudaq::realtime::RPCResponse);
-      for (std::uint64_t i = 0; i < n; ++i)
-        corrections_log_.push_back((packed[i / 8] >> (i % 8)) & 0x1u);
-      ++corrections_read_;
-    }
-    release_response(slot);
-    ++synchronous_ops_;
-    return 0;
-  }
-
   /// Mirror of rpc_producer::release_slot: wipe the TX body so a stale magic
   /// cannot be misread on reuse, fence, then drop the flag.
   void release_response(std::uint32_t slot) {
@@ -438,47 +350,9 @@ private:
     session_->tx_flags_host()[slot] = 0;
   }
 
-  void write_frame(std::uint32_t slot, const event &e, std::uint64_t tag) {
-    std::uint8_t *rx_slot = session_->rx_data_host() + slot * slot_size_;
-    const std::size_t bp_bytes = wire::bit_packed_bytes(e.num_syndromes);
-    const std::size_t body = sizeof(wire::EnqueueRequestPayload) + bp_bytes;
-
-    std::memset(rx_slot, 0, sizeof(cudaq::realtime::RPCHeader) + body);
-
-    auto *header = reinterpret_cast<cudaq::realtime::RPCHeader *>(rx_slot);
-    header->magic = cudaq::realtime::RPC_MAGIC_REQUEST;
-    header->function_id = wire::kEnqueueSyndromesFunctionId;
-    header->arg_len = static_cast<std::uint32_t>(body);
-    header->request_id = static_cast<std::uint32_t>(tag);
-    header->ptp_timestamp = 0;
-
-    auto *p = reinterpret_cast<wire::EnqueueRequestPayload *>(
-        rx_slot + sizeof(cudaq::realtime::RPCHeader));
-    p->decoder_id = static_cast<std::int64_t>(kWireDecoderId);
-    p->counter = static_cast<std::int64_t>(tag);
-    p->syndrome_mapping_id = 0;
-    p->num_syndromes = static_cast<std::int64_t>(e.num_syndromes);
-
-    // Source is one bit per byte; the wire wants them packed LSB-first.
-    std::uint8_t *bits = reinterpret_cast<std::uint8_t *>(p) +
-                         sizeof(wire::EnqueueRequestPayload);
-    for (std::uint64_t i = 0; i < e.num_syndromes; ++i)
-      if (e.syndrome_data[i] & 0x1u)
-        bits[i / 8] |= static_cast<std::uint8_t>(1u << (i % 8));
-
-    __sync_synchronize();
-    // Address-as-flag publish, matching rpc_producer::write_and_signal.
-    session_->rx_flags_host()[slot] =
-        reinterpret_cast<std::uint64_t>(session_->rx_data_dev() +
-                                        slot * slot_size_);
-  }
-
   // ---- decoder + session state ----
   std::size_t syndrome_size_ = 0;
-  std::uint64_t num_observables_ = 0;
-  std::vector<std::uint8_t> corrections_;
   std::uint64_t corrections_read_ = 0;
-  std::vector<std::uint8_t> corrections_log_;
   std::vector<std::unique_ptr<cudaq::qec::decoder>> decoders_;
   std::unique_ptr<cudaq::qec::realtime::qec_realtime_session> session_;
 
@@ -489,9 +363,6 @@ private:
   std::uint64_t synchronous_ops_ = 0;
   std::uint64_t stalls_ = 0;
   std::uint64_t rpc_errors_ = 0;
-
-  // ---- read outcome counters ----
-  std::uint32_t last_not_ready_retries_ = 0;
 };
 
 } // namespace

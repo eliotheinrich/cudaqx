@@ -14,11 +14,16 @@
 /// `make_ring_buffer_injector_sink` drives a local in-process decoder.
 /// `make_udp_server_sink` ships the same RPC frames to a remote
 /// `decoding_server` over UDP, and is the default for remote work.
-/// `make_udp_ring_sink` is a retired reference that does the same through the
-/// RoCE-shaped ring API.
 ///
-/// All three produce the same playback file format and the same lateness
+/// Both produce the same playback file format and the same lateness
 /// statistics, so results are directly comparable.
+///
+/// The ring-buffer-injector and UDP-server sinks share their dispatch logic
+/// via `sink`/`rpc_call.h`: `sink::send`/`sink::try_get_corrections` build a
+/// generic `rpc_call` (see `build_rpc_call`) and hand it to the sink's
+/// `transport()` override, which knows only how to move an already-built
+/// frame to and from its destination. Neither sink builds a wire frame or
+/// decides retry policy itself.
 
 #include "playback_emulator.h"
 
@@ -59,27 +64,5 @@ std::unique_ptr<sink> make_udp_server_sink(const std::string &host,
                                            std::size_t decoder_id,
                                            std::uint32_t slot_size,
                                            std::uint64_t observables);
-
-/// RETIRED REFERENCE -- prefer `make_udp_server_sink`.
-///
-/// The same RPCs through the RoCE-shaped ring API (see udp_wrapper.h), kept as
-/// the only in-tree example of driving that interface and as the baseline the
-/// default sink is measured against.  It needs a ring depth to be chosen and
-/// runs about half as fast as the socket it wraps.
-///
-/// Slot geometry must match the server's `--num-slots` / `--slot-size`.
-///
-/// @param host        Server host, e.g. "127.0.0.1".
-/// @param port        The `port=` value from the server's READY line.
-/// @param decoder_id  Routing key written into every payload.
-/// @param num_slots   Ring slots, matching the server.
-/// @param slot_size   Slot stride in bytes, matching the server.
-/// @param observables Correction bits to request on each get_corrections.
-std::unique_ptr<sink> make_udp_ring_sink(const std::string &host,
-                                         std::uint16_t port,
-                                         std::size_t decoder_id,
-                                         std::uint32_t num_slots,
-                                         std::uint32_t slot_size,
-                                         std::uint64_t observables);
 
 } // namespace cudaq::qec::emulator

@@ -58,7 +58,7 @@ struct playback_result {
 static std::unique_ptr<sink>
 make_sink(const std::string &sink_name, std::uint64_t decoder_id,
           const std::string &config, const std::string &dem_file,
-          const std::string &server_host, int server_port, int server_slots,
+          const std::string &server_host, int server_port,
           int server_slot_size, int server_observables) {
   if (sink_name == "null")
     return std::make_unique<null_sink>();
@@ -70,16 +70,9 @@ make_sink(const std::string &sink_name, std::uint64_t decoder_id,
                                 decoder_id,
                                 static_cast<std::uint32_t>(server_slot_size),
                                 static_cast<std::uint64_t>(server_observables));
-  if (sink_name == "udp_ring")
-    return make_udp_ring_sink(server_host,
-                              static_cast<std::uint16_t>(server_port),
-                              decoder_id,
-                              static_cast<std::uint32_t>(server_slots),
-                              static_cast<std::uint32_t>(server_slot_size),
-                              static_cast<std::uint64_t>(server_observables));
   throw std::invalid_argument("unknown sink '" + sink_name +
                               "'; expected null, ring_buffer_injector, "
-                              "udp_server, or udp_ring");
+                              "or udp_server");
 }
 
 static playback_result
@@ -124,7 +117,7 @@ playback_result run_playback(const std::string &playback,
                              std::uint64_t lead_in_ns,
                              const std::string &tick, bool deltas, int pin_cpu,
                              const std::string &server_host, int server_port,
-                             int server_slots, int server_slot_size,
+                             int server_slot_size,
                              int server_observables,
                              const std::string &dem_file, bool wait_for_ready,
                              const std::string &csv_file) {
@@ -170,7 +163,7 @@ playback_result run_playback(const std::string &playback,
       spin_slack_ns ? spin_slack_ns : 2 * measure_wakeup_overshoot();
 
   auto dst = make_sink(sink_name, decoder_id, config, dem_file, server_host,
-                       server_port, server_slots, server_slot_size,
+                       server_port, server_slot_size,
                        server_observables);
 
   const auto meta_it = file.meta.find(decoder_id);
@@ -320,7 +313,7 @@ Args:
         nb::arg("lead_in_ns") = 50000000, nb::arg("tick") = "1us",
         nb::arg("deltas") = false, nb::arg("pin_cpu") = -1,
         nb::arg("server_host") = "127.0.0.1", nb::arg("server_port") = 0,
-        nb::arg("server_slots") = 8, nb::arg("server_slot_size") = 256,
+        nb::arg("server_slot_size") = 256,
         nb::arg("server_observables") = 1, nb::arg("dem_file") = "",
         nb::arg("wait_for_ready") = false, nb::arg("csv") = "",
         R"doc(Load a playback file and replay it into the decoder.
@@ -334,7 +327,7 @@ sources: dict mapping the integers used in `source_id=N` to SyndromeSource
          instances (StaticSyndromeSource, StimCircuitSource, StimMemorySource,
          or your own Python subclass).  An unregistered id is an error.
 
-sink: "null", "ring_buffer_injector", "udp_server", or "udp_ring".
+sink: "null", "ring_buffer_injector", or "udp_server".
 tick: tick duration, e.g. "100us".  Must match the tick column in the file.
 )doc");
 

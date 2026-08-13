@@ -23,8 +23,11 @@
 /// the table: the schedule shifts naturally, no event is dropped, and the
 /// lateness shows up in the stats rather than being silently absorbed.
 ///
-/// This header is deliberately free of CUDA-Q dependencies so the timing core
-/// can be built and characterized (against `null_sink`) on any machine.
+/// This header declares `sink`'s dispatch surface but not its RPC-object
+/// plumbing: `sink::transport()` takes a forward-declared `rpc_call`, whose
+/// definition (and the CUDA-Q wire-format headers it needs) lives in
+/// `rpc_call.h`, included only by `playback_emulator.cpp` and the concrete
+/// sinks.
 
 #include "syndrome_source.h"
 
@@ -51,28 +54,15 @@ struct run_config {
   std::uint64_t lead_in_ns = 50'000'000;
   /// Core to pin the timing thread to, or -1 for no affinity change.
   int pin_cpu = -1;
-  /// Retry policy for `get_corrections` when the decoder answers NOT_READY.
+  /// Retry policy for `get_corrections` when the decoder answers NOT_READY
+  /// (fired before the decoder has finished collecting/decoding).
   ///
-  /// The decoder session has a simple state machine: `collecting` while it
-  /// accumulates syndrome bits, then `result_ready` once enough have arrived
-  /// and the decode has completed.  A `get_corrections` RPC that arrives while
-  /// the session is still `collecting` returns NOT_READY.  This happens when
-  /// the playback schedule fires `get_corrections` before the decoder has
-  /// finished -- either the timing budget is too tight or the decoder itself
-  /// is slow.
+  /// Default (false): treated as an error -- throws, surfacing a schedule
+  /// that is too tight rather than returning stale corrections.
   ///
-  /// Default (false): NOT_READY is treated as an error.  The sink increments
-  /// `reads_not_ready()` and throws, aborting the run.  This is the right
-  /// choice for a correctly sized schedule: it surfaces misconfiguration
-  /// loudly rather than silently returning stale corrections.
-  ///
-  /// True: the sink spins retrying (within `kReclaimTimeoutMs`) until the
-  /// session transitions to `result_ready`.  The timing thread blocks past
-  /// its original deadline, so latency and overrun stats reflect the extra
-  /// wait.  Use this to separate "decoder is inherently too slow for this
-  /// schedule" from "the schedule is slightly too tight but the decoder
-  /// eventually catches up".  `record::not_ready_retries` counts the retries
-  /// per event so you can see how many polls each read required.
+  /// True: retries until the decoder is ready or a fixed timeout elapses.
+  /// The timing thread blocks past its deadline, so latency/overrun stats
+  /// reflect the wait.  `record::not_ready_retries` counts the retries.
   bool wait_for_ready = false;
 };
 
@@ -84,76 +74,55 @@ struct run_config {
 //
 //     <tick> <operation> <decoder_id> [operands...]
 //
-//   tick        Unsigned integer TICK INDEX, counted from the start of the run
-//               (t0).  A tick is a fixed wall-clock duration supplied
-//               separately (`--tick=1us`, or `tick_ns` to `build_events`), so a
-//               file describes a cadence in the units the hardware actually
-//               runs at, and the same file can be replayed faster or slower by
-//               changing one parameter.
-//
-//               Absolute by default -- tick 7 is the 7th tick boundary, not
-//               "7 after the last one" -- and must be non-decreasing.  Pass
-//               `deltas = true` to `build_events` to read the column as gaps in
-//               ticks instead, which is often easier to write by hand.
-//   operation   One of the three below.  An unknown operation is a parse error,
-//               never a silent skip.
+//   tick        Tick index from the start of the run (t0); a tick's wall-clock
+//               duration is supplied separately (`--tick=1us`), so one file
+//               replays at any cadence. Absolute and non-decreasing by
+//               default; pass `deltas = true` to `build_events` to read it as
+//               a gap from the previous kept record instead.
+//   operation   enqueue | get_corrections | reset | stream_until.  Unknown is
+//               a parse error, never a silent skip.
 //   decoder_id  Which syndrome source this record belongs to.  ONE file can
-//               describe a whole multi-source experiment; each emulator
-//               process selects its own decoder's records and ignores the rest
-//               (see `build_events`).
+//               describe a multi-source experiment; each emulator process
+//               keeps only its own decoder's records (see `build_events`).
 //
 // Operations and their operands:
 //
 //   enqueue <bits>
-//       Push one round of syndrome bits.  `bits` is a run of `0`/`1`
-//       characters, one per syndrome bit, no separators.  Fire-and-forget on
-//       the wire: the dispatcher ACKs but returns no body.
+//       Push one round of syndrome bits (a run of `0`/`1` chars). Fire-and-
+//       forget: the dispatcher ACKs but returns no body.
 //
 //   get_corrections [expected_bits]
-//       Read back the accumulated corrections.  Always returns the decoder's
-//       declared observable count -- that is the only width it accepts -- and
-//       never resets.  Follow it with an explicit `reset` when a shot boundary
-//       needs the accumulator cleared, so that clearing is visible in the file
-//       rather than hidden in a flag.
+//       Read back the accumulated corrections, at the decoder's declared
+//       observable width. Never resets -- follow with an explicit `reset`
+//       when a shot boundary needs the accumulator cleared.
 //
-//       `expected_bits` is an OPTIONAL run of `0`/`1` characters, one per
-//       observable, written immediately after the decoder_id column.  When
-//       present, `run()` compares each read's actual corrections against those
-//       bits and records any mismatch in `record::correction_mismatch`.
+//       Optional `expected_bits` (one `0`/`1` char per observable): `run()`
+//       compares it against the actual read and sets `record::
+//       correction_mismatch` on a mismatch.
 //
 //   reset
 //       Clear the decoder's queued syndromes and zero its corrections.
 //
 //   stream_until source_id=N [expected_bits]
-//       Feed syndrome rounds from a registered syndrome_source into the decoder
-//       one at a time, polling try_get_corrections() after each, until the
-//       decoder signals ready or the source returns an empty vector (EOF).
-//       Uses the same source_id=N registration as enqueue; the source is
-//       called repeatedly via next_round() for as long as needed.
+//       Feed rounds from a registered syndrome_source one at a time, polling
+//       try_get_corrections() after each, until the decoder is ready or the
+//       source is exhausted (empty round).
 //
-//       stream_until ABSORBS the read: the poll that succeeds is a consuming
-//       get_corrections, so the correction bits land in `sink::corrections()`
-//       exactly as an explicit `get_corrections` record would produce them.
-//       Do NOT follow a stream_until with a get_corrections -- the result has
-//       already been taken, and the second read would block for a decode that
-//       was never started.
+//       ABSORBS the read: the successful poll is a consuming get_corrections,
+//       so its bits land in `sink::corrections()` same as an explicit read
+//       would. Do NOT follow with a get_corrections -- the result is already
+//       taken and the second read would block forever.
 //
-//       `expected_bits` is optional and behaves exactly as on get_corrections.
-//       Example:
-//           0  stream_until  0  source_id=2
+//       `expected_bits` behaves exactly as on get_corrections, e.g.:
 //           0  stream_until  0  source_id=2  10   # expected: obs0=1 obs1=0
 //
 // Blank lines are ignored and `#` starts a comment that runs to end of line.
 //
-// Example:
-//     # tick    op               dec  operands      (with --tick=1us)
-//     0         reset            0
-//     1         enqueue          0    010
-//     2         enqueue          0    110
-//     2         enqueue          1    001
-//     3         get_corrections  0                 # no expectation
-//     3         get_corrections  0    10           # expected: obs0=1 obs1=0
-//     4         reset            0
+// Example (with --tick=1us):
+//     0  reset            0
+//     1  enqueue          0  010
+//     2  get_corrections  0  10   # expected: obs0=1 obs1=0
+//     3  reset            0
 //
 //===----------------------------------------------------------------------===//
 
@@ -181,27 +150,23 @@ bool takes_syndromes(operation op);
 /// into the poll that ends its streaming loop.
 bool returns_corrections(operation op);
 
-/// One parsed record.  The syndrome bits (and any expected correction bits)
-/// live in the file's shared arenas rather than in the record, so a record
-/// stays small and the bits stay contiguous.
+/// One parsed record.  Syndrome/expected-correction bits live in the file's
+/// shared arenas rather than in the record, so a record stays small and the
+/// bits stay contiguous.
 struct playback_record {
   std::uint64_t tick;
   operation op;
   std::uint64_t decoder_id;
-  /// Syndrome bits: index into `playback_file::syndromes` and byte count.
-  /// Both are 0 for non-enqueue records and for source-referenced enqueues.
+  /// Index/count into `playback_file::syndromes`.  0/0 for non-enqueue and
+  /// source-referenced enqueue records.
   std::size_t syndrome_offset;
   std::uint64_t syndrome_count;
-  /// Optional expected correction bits, parallel to the syndrome fields.
-  /// `corrections_offset` is an index into `playback_file::corrections`;
-  /// `corrections_count` is the number of bytes (one byte per observable bit,
-  /// same layout as `sink::corrections()`).  Both are 0 unless
-  /// `op == get_corrections` AND the playback file carried a bit string on
-  /// that line.
+  /// Index/count into `playback_file::corrections` (one byte per observable
+  /// bit).  0/0 unless `op == get_corrections` and the line carried bits.
   std::size_t corrections_offset;
   std::uint64_t corrections_count;
-  /// Source ID for enqueue records that carry `source_id=N` instead of inline
-  /// bits.  -1 means the syndrome data is inline in the arena.
+  /// `source_id=N` for enqueue records referencing a source instead of
+  /// inline bits.  -1 means inline.
   std::int64_t source_id = -1;
 };
 
@@ -222,31 +187,25 @@ struct playback_file {
   std::map<std::uint64_t, playback_meta> meta; ///< Keyed by decoder_id.
 };
 
-/// A scheduled send, fully resolved at load time: a slice of the arena plus its
-/// deadline as an offset from `t0`.  Neither field is recomputed or mutated
-/// once the run starts.
+/// A scheduled send, fully resolved at load time: a slice of the arena plus
+/// its deadline as an offset from `t0`.  Neither is recomputed once the run
+/// starts.
 struct event {
   operation op;
-  /// Into `playback_file::syndromes`.  One bit per byte (0x00/0x01), which is
-  /// the shape `rpc_producer::enqueue_syndromes` wants.  Null unless
-  /// `takes_syndromes(op)`.  Also null for source-backed enqueue events; in
-  /// that case `source` is non-null and `run()` calls `source->next_round()`.
+  /// One byte per bit (0x00/0x01), into `playback_file::syndromes`.  Null
+  /// unless `takes_syndromes(op)`, and also null for source-backed enqueue
+  /// events (then `source` is non-null and `run()` pulls from it instead).
   const std::uint8_t *syndrome_data;
-  /// Syndrome bit count (same as the byte length of `syndrome_data` due to
-  /// the one-bit-per-byte layout).  0 for source-backed events until resolved.
+  /// Bit count for `syndrome_data`.  0 for source-backed events until resolved.
   std::uint64_t num_syndromes;
   /// Resolved from `source_id=N` by `build_events`.  Non-null exactly when the
-  /// record named a source: `enqueue` takes one `next_round()` from it,
-  /// `stream_until` takes rounds until the decoder is ready.  Null for
-  /// inline-bit events.
+  /// record named a source; null for inline-bit events.
   syndrome_source *source = nullptr;
   std::uint64_t offset_ns;
-  /// Optional expected correction bits, populated from `playback_record::
-  /// corrections_offset/corrections_count`.  Null (and corrections_count == 0)
-  /// for every event except get_corrections events whose playback record
-  /// carried expected bits.  One byte per observable (0x00/0x01), same layout
-  /// as `sink::corrections()`.  `run()` checks these against the sink's output
-  /// and records any mismatch in `record::correction_mismatch`.
+  /// Optional expected correction bits (one byte per observable, same layout
+  /// as `sink::corrections()`), from `playback_record::corrections_*`.  Null
+  /// unless the record carried expected bits.  `run()` diffs these against
+  /// the sink's output into `record::correction_mismatch`.
   const std::uint8_t *corrections_data = nullptr;
   std::uint64_t corrections_count = 0;
 };
@@ -302,16 +261,33 @@ bool parse_duration_ns(const std::string &text, std::uint64_t &out);
 // Sinks
 //===----------------------------------------------------------------------===//
 
+/// Opaque here; defined in rpc_call.h, included by playback_emulator.cpp and
+/// the concrete sinks.  See the file comment above for why the split exists.
+struct rpc_call;
+
 /// Destination for scheduled payloads.  `send` is the only thing the runner
 /// calls on the timing thread, and it sits directly in the critical path:
 /// implementations must not allocate, log, or block on anything avoidable.
+///
+/// `send`/`try_get_corrections` build a generic `rpc_call` (see
+/// `build_rpc_call` in rpc_call.h) and hand it to the one method a concrete
+/// sink implements, `transport()`.  A sink therefore knows only how to move
+/// an already-built RPC frame to and from its destination -- a ring slot, a
+/// UDP datagram, or (`null_sink`) nowhere at all -- never how to build a
+/// frame, decide blocking/retry policy, or unpack a correction reply.  Adding
+/// an RPC to the protocol means teaching `build_rpc_call` one more case, not
+/// touching every sink.
 class sink {
 public:
   virtual ~sink() = default;
 
   /// @param e   The event whose deadline has just passed.
   /// @param tag Application breadcrumb; the runner passes the event index.
-  virtual void send(const event &e, std::uint64_t tag) = 0;
+  ///
+  /// A no-op for `stream_until`, which has no wire RPC of its own: `run()`
+  /// drives it as a client-side loop of synthesized `enqueue` events and
+  /// `try_get_corrections()` polls instead of a single `send()`.
+  void send(const event &e, std::uint64_t tag);
 
   /// Name for the run header.
   virtual const char *name() const = 0;
@@ -327,14 +303,13 @@ public:
   /// Correction bits from every `get_corrections`, one byte per bit (0 or 1),
   /// laid out row-major as `reads x correction_width()`.  Empty for sinks that
   /// never read any.
-  virtual const std::vector<std::uint8_t> &corrections() const {
-    static const std::vector<std::uint8_t> empty;
-    return empty;
+  const std::vector<std::uint8_t> &corrections() const {
+    return corrections_log_;
   }
 
-  /// Bits per read: the decoder's declared observable count.  0 when the sink
-  /// reads no corrections.
-  virtual std::size_t correction_width() const { return 0; }
+  /// Bits per read: the decoder's declared observable count, fixed at
+  /// construction.  0 when the sink reads no corrections.
+  std::size_t correction_width() const { return num_observables_; }
 
   /// Total syndrome bits the decoder expects per shot.  0 when unknown (null /
   /// udp_server sinks have no local decoder to ask).
@@ -344,41 +319,81 @@ public:
   /// Reset to 0 at the start of every send call; non-zero only when the
   /// sink retried under `wait_for_ready`.  `run()` reads this after each
   /// send and stores the value in `record::not_ready_retries`.
-  virtual std::uint32_t last_not_ready_retries() const { return 0; }
-
-  /// Non-blocking poll used by `stream_until`: ask the decoder for corrections
-  /// without blocking.  Returns true if corrections landed (the same bits are
-  /// appended to `corrections()` as a normal `get_corrections` would), false
-  /// if the decoder answered NOT_READY.
-  ///
-  /// Sinks that do not support `stream_until` throw `std::logic_error`.  The
-  /// null_sink returns false (source is always exhausted, never "ready").
-  virtual bool try_get_corrections() {
-    throw std::logic_error(
-        "this sink does not support try_get_corrections / stream_until");
+  std::uint32_t last_not_ready_retries() const {
+    return last_not_ready_retries_;
   }
+
+  /// Non-blocking poll used by `stream_until`: ask for corrections without
+  /// retrying on NOT_READY.  A consuming `get_corrections` call, so a
+  /// successful poll (bits appended to `corrections()`) needs no follow-up
+  /// read.  Returns false on NOT_READY.
+  bool try_get_corrections();
 
   /// Set the NOT_READY retry policy for this sink.
   void set_wait_for_ready(bool v) { wait_for_ready_ = v; }
 
 protected:
+  /// @param decoder_id      Wire routing key baked into every rpc_call this
+  ///                        sink builds.
+  /// @param num_observables Decoder's declared observable count; drives
+  ///                        `correction_width()` and the size of the reply
+  ///                        scratch buffer passed to `transport()`.
+  sink(std::uint64_t decoder_id, std::uint64_t num_observables);
+
+  /// Update the observable count (and reply scratch buffer size) after
+  /// construction, for a sink that only learns it once it has parsed its own
+  /// config and so cannot pass it to the base constructor's member-init list.
+  void set_num_observables(std::uint64_t n);
+
+  /// The ONLY method a concrete sink implements: perform one RPC round trip
+  /// already fully described by `call`.
+  ///
+  ///  - If `!call.blocking`: publish the frame and return; status is ignored
+  ///    (fire-and-forget, e.g. enqueue).
+  ///  - If `call.blocking`: must not return until a status is known (0 == OK;
+  ///    `wire::RpcStatus::NOT_READY`; or another `wire::RpcStatus`).  Must NOT
+  ///    throw on NOT_READY -- that is the caller's retry decision.
+  ///  - If `call.blocking && status == 0 && call.expected_result_bits > 0`:
+  ///    write the reply's bit-packed result body into `result_buf` (sized
+  ///    from `num_observables` above).
+  virtual std::int32_t transport(const rpc_call &call,
+                                 std::uint8_t *result_buf) = 0;
+
   bool wait_for_ready_ = false;
+  std::uint64_t decoder_id_;
+  std::uint64_t num_observables_;
+
+private:
+  std::int32_t dispatch_once(const rpc_call &call);
+  std::int32_t dispatch_with_retry(const rpc_call &call);
+  void unpack_and_log_corrections(const std::uint8_t *packed,
+                                  std::size_t n_bits);
+
+  std::vector<std::uint8_t> corrections_log_;
+  std::vector<std::uint8_t> result_scratch_;
+  std::uint32_t last_not_ready_retries_ = 0;
+  std::uint64_t next_request_id_ = 1;
 };
 
 /// Discards everything.  Running the same schedule against this first gives
-/// the emulator's jitter floor.
+/// the emulator's jitter floor.  Still builds and serializes the generic RPC
+/// object for every event, same as a real sink, so the jitter floor reflects
+/// that cost too; it just never delivers the frame anywhere.
 class null_sink : public sink {
 public:
-  void send(const event &e, std::uint64_t tag) override;
+  null_sink() : sink(/*decoder_id=*/0, /*num_observables=*/0) {}
   const char *name() const override { return "null"; }
-  /// Always returns false so stream_until exhausts the source completely.
-  bool try_get_corrections() override { return false; }
 
   /// Kept so the compiler cannot optimize the payload read away.
   std::uint64_t checksum() const { return checksum_; }
 
+protected:
+  std::int32_t transport(const rpc_call &call,
+                         std::uint8_t *result_buf) override;
+
 private:
   std::uint64_t checksum_ = 0;
+  std::vector<std::uint8_t> frame_scratch_;
 };
 
 //===----------------------------------------------------------------------===//
@@ -390,26 +405,18 @@ private:
 /// to `t0`.
 struct record {
   std::uint64_t deadline_ns; ///< Where the event was supposed to go out.
-  std::uint64_t call_ns;     ///< When the sink call began.  Lateness =
-                             ///< `call_ns - deadline_ns`.
-  std::uint64_t return_ns;   ///< When the sink call returned.  Latency =
-                             ///< `return_ns - call_ns`.
-  /// NOT_READY retries for this event (get_corrections only).  0 when the
-  /// sink answered OK on the first attempt, or for all other operations.
+  std::uint64_t call_ns;     ///< Sink call start.  Lateness = call - deadline.
+  std::uint64_t return_ns;   ///< Sink call end.  Latency = return - call.
+  /// NOT_READY retries for this event.  0 unless the sink retried a read.
   std::uint32_t not_ready_retries = 0;
-  /// True when this get_corrections event carried expected correction bits
-  /// in the playback file AND the actual corrections differed.  Also true on
-  /// a width mismatch.  Always false for other operations and for events
-  /// without expected bits.
+  /// True when this read carried expected correction bits that differed from
+  /// (or mismatched the width of) the actual read.
   bool correction_mismatch = false;
-  /// Number of syndrome rounds fed into the decoder by a `stream_until` event.
-  /// Zero for all other operations.
+  /// Syndrome rounds fed by a `stream_until` event.  0 for other operations.
   std::uint64_t syndromes_streamed = 0;
   /// True when this event actually took a correction off the decoder: always
-  /// for `get_corrections`, and for `stream_until` only when the decoder
-  /// signalled ready before the source hit EOF.  A false here on a
-  /// stream_until means the source ran dry mid-decode, so no correction was
-  /// produced and none was consumed from `sink::corrections()`.
+  /// for `get_corrections`; for `stream_until` only if the source didn't run
+  /// dry first (in which case no correction was produced or consumed).
   bool read_completed = false;
 };
 

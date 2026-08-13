@@ -7,11 +7,13 @@
  ******************************************************************************/
 
 #include "playback_emulator.h"
+#include "rpc_call.h"
 
 #include <algorithm>
 #include <atomic>
 #include <cctype>
 #include <cerrno>
+#include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -137,14 +139,12 @@ bool parse_u64(const std::string &text, std::uint64_t &out) {
   }
 }
 
-/// Mirrors kMaxSyndromeBits.  Duplicated rather than
-/// included so this file stays free of CUDA-Q headers (see the note in
-/// playback_emulator.h); the session sink validates against the real constant.
-constexpr std::uint64_t kMaxSyndromeBits = 1u << 20;
-
 /// Held open for the process lifetime: the C-state floor lasts only as long as
 /// the fd, so closing it would silently give the deep idle states back.
 int g_cpu_dma_latency_fd = -1;
+
+/// Bound on the NOT_READY retry loop.
+constexpr int kNotReadyTimeoutMs = 5000;
 
 } // namespace
 
@@ -303,9 +303,9 @@ playback_file load_playback(const std::string &path) {
           file.syndromes.push_back(static_cast<std::uint8_t>(c - '0'));
         }
         rec.syndrome_count = token.size();
-        if (rec.syndrome_count > kMaxSyndromeBits)
+        if (rec.syndrome_count > wire::kMaxSyndromeBits)
           fail("syndrome is " + std::to_string(rec.syndrome_count) +
-               " bits, over the " + std::to_string(kMaxSyndromeBits) +
+               " bits, over the " + std::to_string(wire::kMaxSyndromeBits) +
                "-bit wire cap");
       }
     }
@@ -434,14 +434,118 @@ std::vector<event> build_events(const playback_file &file,
 // Sinks
 //===----------------------------------------------------------------------===//
 
-void null_sink::send(const event &e, std::uint64_t tag) {
-  // Touch the first and last byte so the payload slice is genuinely resident
-  // and the read cannot be optimized out; anything heavier would pollute the
-  // jitter floor this sink exists to measure.  `reset` and `get_corrections`
-  // carry no payload, so guard the dereference.
-  checksum_ += tag + static_cast<std::uint64_t>(e.op);
-  if (e.syndrome_data != nullptr && e.num_syndromes > 0)
-    checksum_ += e.syndrome_data[0] + e.syndrome_data[e.num_syndromes - 1];
+sink::sink(std::uint64_t decoder_id, std::uint64_t num_observables)
+    : decoder_id_(decoder_id), num_observables_(num_observables) {
+  // Sized once, here, so transport() never allocates on the timing thread.
+  result_scratch_.assign(
+      std::max<std::size_t>(wire::bit_packed_bytes(num_observables_), 1), 0);
+}
+
+void sink::set_num_observables(std::uint64_t n) {
+  num_observables_ = n;
+  result_scratch_.assign(std::max<std::size_t>(wire::bit_packed_bytes(n), 1),
+                         0);
+}
+
+void sink::send(const event &e, std::uint64_t tag) {
+  if (e.op == operation::stream_until)
+    return; // no wire RPC of its own; run() drives it via enqueue + poll
+  last_not_ready_retries_ = 0;
+  const rpc_call call =
+      build_rpc_call(e.op, e, decoder_id_, num_observables_, tag,
+                     /*consuming=*/false, wait_for_ready_);
+  const std::int32_t status = dispatch_with_retry(call);
+  if (status != 0)
+    throw std::runtime_error(std::string(name()) + ": RPC returned status " +
+                             std::to_string(status));
+}
+
+bool sink::try_get_corrections() {
+  const event dummy{};
+  const rpc_call call = build_rpc_call(
+      operation::get_corrections, dummy, decoder_id_, num_observables_,
+      next_request_id_++, /*consuming=*/true, /*retry_on_not_ready=*/false);
+  const std::int32_t status = dispatch_once(call);
+  if (status == static_cast<std::int32_t>(wire::RpcStatus::NOT_READY))
+    return false;
+  if (status != 0)
+    throw std::runtime_error(std::string(name()) +
+                             "::try_get_corrections: status " +
+                             std::to_string(status));
+  return true;
+}
+
+std::int32_t sink::dispatch_once(const rpc_call &call) {
+  const std::int32_t status = transport(
+      call, call.expected_result_bits > 0 ? result_scratch_.data() : nullptr);
+  if (status == 0 && call.expected_result_bits > 0)
+    unpack_and_log_corrections(result_scratch_.data(),
+                               call.expected_result_bits);
+  return status;
+}
+
+std::int32_t sink::dispatch_with_retry(const rpc_call &call) {
+  if (!call.blocking)
+    return transport(call, nullptr); // fire-and-forget: status ignored
+
+  const auto deadline = std::chrono::steady_clock::now() +
+                        std::chrono::milliseconds(kNotReadyTimeoutMs);
+  while (true) {
+    const std::int32_t status = dispatch_once(call);
+    if (status == 0)
+      return 0;
+    if (status != static_cast<std::int32_t>(wire::RpcStatus::NOT_READY))
+      return status;
+    ++last_not_ready_retries_;
+    if (!call.retry_on_not_ready)
+      throw std::runtime_error(
+          std::string(name()) +
+          ": RPC returned NOT_READY (the schedule may be too tight; use "
+          "--wait-for-ready to retry until the decoder is done)");
+    if (std::chrono::steady_clock::now() >= deadline)
+      throw std::runtime_error(std::string(name()) +
+                               ": wait_for_ready timed out after " +
+                               std::to_string(kNotReadyTimeoutMs) + " ms");
+    EMULATOR_CPU_RELAX();
+  }
+}
+
+void sink::unpack_and_log_corrections(const std::uint8_t *packed,
+                                      std::size_t n_bits) {
+  for (std::size_t i = 0; i < n_bits; ++i)
+    corrections_log_.push_back((packed[i / 8] >> (i % 8)) & 0x1u);
+}
+
+std::int32_t null_sink::transport(const rpc_call &call,
+                                  std::uint8_t *result_buf) {
+  // Still pays the framing/bit-packing cost a real sink would; see the class
+  // comment.  The frame is built and checksummed, then discarded.
+  const std::size_t frame_len =
+      sizeof(cudaq::realtime::RPCHeader) + call.payload_len +
+      (call.bits ? wire::bit_packed_bytes(call.num_bits) : 0);
+  if (frame_scratch_.size() < frame_len)
+    frame_scratch_.resize(frame_len);
+  const std::size_t written =
+      serialize_rpc_frame(call, static_cast<std::uint32_t>(call.tag),
+                          frame_scratch_.data(), frame_scratch_.size());
+  for (std::size_t i = 0; i < written; ++i)
+    checksum_ += frame_scratch_[i];
+
+  // No decoder behind this sink, so neither shape of get_corrections call
+  // returns real bits (num_observables_ is 0). They still answer
+  // differently: the stream_until poll (consuming, reset=1) must return
+  // NOT_READY so the loop always exhausts its source; an explicit
+  // get_corrections (reset=0) must succeed silently, since playback files
+  // run it against `null` as a baseline. Reuse the `reset` byte already on
+  // the wire to tell the two apart, same as every other sink does.
+  (void)result_buf;
+  if (call.function_id == wire::kGetCorrectionsFunctionId) {
+    const auto *p = reinterpret_cast<const wire::GetCorrectionsRequestPayload *>(
+        call.payload.data());
+    if (p->reset)
+      return static_cast<std::int32_t>(wire::RpcStatus::NOT_READY);
+  }
+  return 0;
 }
 
 //===----------------------------------------------------------------------===//
